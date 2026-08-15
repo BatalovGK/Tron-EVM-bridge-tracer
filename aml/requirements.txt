@@ -1,0 +1,8 @@
+aiohttp
+aiosqlite
+asyncpg
+pyyaml
+ollama
+python-dotenv
+pytest
+pytest-asyncio

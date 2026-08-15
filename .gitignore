@@ -1,0 +1,23 @@
+# Secrets — never commit real credentials. Only .env.example (template, no
+# real values) is meant to be tracked.
+.env
+.env.*
+!.env.example
+*_FILE
+secrets/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+
+# Local SQLite caches created by tron_adapter/evm_adapter at runtime
+*.db
+*.db-journal
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db

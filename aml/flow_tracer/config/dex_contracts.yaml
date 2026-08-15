@@ -1,0 +1,42 @@
+# flow_tracer/config/dex_contracts.yaml
+#
+# chain_id -> список известных DEX router/factory контрактов -> protocol_key.
+# Используется swap_resolver.py, чтобы по адресам, с которыми взаимодействовала
+# транзакция (raw-trace/decoded logs из Blockscout), понять: это своп через
+# известный протокол (и какой subgraph из dex_subgraphs.yaml запрашивать), или
+# обычный перевод (тогда TheGraph вообще не дёргаем).
+#
+# ВАЖНО: адреса контрактов ТОЖЕ не угадываются по памяти. Помечено "ПРОВЕРЕНО" —
+# сверено по официальной документации протокола или блок-эксплореру на момент
+# записи (см. дату и источник в комментарии). Официальный источник адресов:
+# https://docs.uniswap.org/contracts/v3/reference/deployments/<chain>-deployments
+# Также: UniversalRouter — актуальный основной entrypoint Uniswap (сменил
+# SwapRouter02), адрес свой на каждой сети — если торговля в основном идёт через
+# него, а не через SwapRouter02, добавьте отдельной записью с тем же protocol_key.
+#
+# protocol_key должен совпадать с ключом в dex_subgraphs.yaml для этой же сети.
+
+1:  # Ethereum Mainnet
+  "0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45": "uniswap_v3"  # ПРОВЕРЕНО 2026-07-21: Etherscan ("Uniswap V3: Router 2") + github.com/Uniswap/swap-router-contracts/releases ("SwapRouter02 is deployed and verified on Etherscan for on all networks at the address: 0x68b3...")
+  "0x3fc91a3afd70395cd496c647d5a6cc9d4b2b7fad": "uniswap_v3"  # UniversalRouter — ПРОВЕРЕНО 2026-07-21: два независимых источника согласны (github.com/Uniswap/docs PR #629; pypi.org/project/uniswap-universal-router-decoder README)
+
+56:  # BNB Chain
+  "0xb971ef87ede563556b2ed4b1c0b0019111dd85d2": "uniswap_v3"  # ПРОВЕРЕНО 2026-07-20, BscScan: "Uniswap V3: Swap Router 2"
+
+137:  # Polygon
+  "0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45": "uniswap_v3"  # ПРОВЕРЕНО 2026-07-21: Uniswap/docs PR #629 (github.com/Uniswap/docs/pull/629/files) — SwapRouter02 одинаковый на Mainnet/Arbitrum/Optimism/Polygon
+  "0x3fc91a3afd70395cd496c647d5a6cc9d4b2b7fad": "uniswap_v3"  # UniversalRouter — тот же адрес, что на Mainnet (PR #629)
+
+42161:  # Arbitrum One
+  "0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45": "uniswap_v3"  # ПРОВЕРЕНО 2026-07-21, Arbiscan: "Uniswap V3: Router 2"
+  "0x3fc91a3afd70395cd496c647d5a6cc9d4b2b7fad": "uniswap_v3"  # UniversalRouter — тот же адрес, что на Mainnet (PR #629)
+
+10:  # Optimism
+  "0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45": "uniswap_v3"  # ПРОВЕРЕНО 2026-07-21, Optimistic Etherscan/codeslaw: "Uniswap V3: Router 2"
+  "0x3fc91a3afd70395cd496c647d5a6cc9d4b2b7fad": "uniswap_v3"  # UniversalRouter — тот же адрес, что на Mainnet (PR #629)
+
+8453:  # Base
+  "0x2626664c2603336e57b271c5c0b26f421741e481": "uniswap_v3"  # ПРОВЕРЕНО 2026-07-20, BaseScan: "Uniswap V3: Swap Router02"
+  # UniversalRouter на Base — ДРУГОЙ адрес, отличный от Mainnet/Arbitrum/Optimism/Polygon
+  # (см. PR #629, отдельная колонка "Base Address") — НЕ заполнено, не хочу вписывать
+  # по одному неподтверждённому упоминанию без независимой перепроверки, как для остальных.
