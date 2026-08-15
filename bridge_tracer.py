@@ -126,6 +126,7 @@ async def trace_full_path(
     start_type: Literal["address", "tx_hash"] = "address",
     mode: str = "incident_response",
     max_hops: int = DEFAULT_MAX_HOPS,
+    max_evm_pages_per_hop: int = 4,
 ) -> dict[str, Any]:
     """
     Единая входная точка: прослеживает полный путь средств от адреса/tx на
@@ -143,6 +144,10 @@ async def trace_full_path(
             в этой версии MVP поведение самого трейсера от mode не зависит —
             все режимы используют одинаковую глубину/логику обхода.
         max_hops: защита от бесконечной рекурсии/циклов на EVM-сегменте.
+        max_evm_pages_per_hop: мягкий потолок страниц Blockscout НА ОДИН хоп
+            пост-bridge обхода (см. _walk_evm) — не хардкод, параметр с
+            дефолтом; действует, только пока не найден подходящий по
+            time-anchoring кандидат на текущем хопе.
 
     Returns:
         Плоский вердикт по формату из briefing_for_claude_code.md
@@ -287,6 +292,7 @@ async def trace_full_path(
     walk = await _walk_evm(
         evm_chain_id, recipient, max_hops=max_hops,
         after_timestamp=crossing["bridge_exit"]["timestamp"],
+        max_pages_per_hop=max_evm_pages_per_hop,
     )
     hops.extend(walk["hops"])
 
@@ -300,6 +306,7 @@ async def trace_full_path(
         exchange_name=exchange_name,
         contract_label=contract_label,
         contract_type=contract_type,
+        note=walk.get("note"),
     )
 
 
@@ -494,8 +501,36 @@ def _parse_iso_timestamp(ts: Optional[str]) -> Optional[float]:
         return None
 
 
+def _known_evm_label(
+    chain_id: int, address: Optional[str], registry_by_address: dict[str, dict[str, Any]],
+) -> Optional[dict[str, Any]]:
+    """
+    Единая точка "известен ли этот EVM-адрес" — сверяется с ДВУМЯ реестрами:
+    known_contracts.py (биржи/DEX/мосты, вручную заполненный реестр меток
+    для стоп-условий пост-bridge обхода) и bridge_registry.py (generic
+    Bridge Contract Registry — используется здесь как задел на будущее, см.
+    докстринг bridge_registry.get_registry_for_evm_chain_id(): сейчас там нет
+    записей ни для одной EVM-сети (официальный реестр USDT0 Deployments API
+    для EVM даёт только "native"/"legacyMesh" OFT/Composer-адреса — они и
+    правда bridge-related, поэтому логично считать их стоп-условием того же
+    рода, что и known_contracts.py type="bridge"). Совпадение в ЛЮБОМ из
+    двух реестров — известный адрес; known_contracts.py проверяется первым
+    (более специфичная, вручную курируемая метка).
+    """
+    label = lookup_contract(chain_id, address)
+    if label is not None:
+        return label
+    if address is None:
+        return None
+    entry = registry_by_address.get(address.lower())
+    if entry is None:
+        return None
+    return {"type": "bridge", "name": f"{entry['protocol']} {entry['contract_role']} (bridge_registry)"}
+
+
 async def _walk_evm(
     chain_id: int, start_address: str, max_hops: int, after_timestamp: Optional[int] = None,
+    max_pages_per_hop: int = 4,
 ) -> dict[str, Any]:
     """
     Линейный пост-bridge обход исходящих ERC-20 переводов от адреса-
@@ -504,58 +539,120 @@ async def _walk_evm(
     здесь не завязан на конкретную сеть, работает так же для Arbitrum/Base/
     Polygon и т.д.).
 
-    Один хоп = САМЫЙ РАННИЙ исходящий перевод СРЕДИ вернувшейся страницы
-    Blockscout, случившийся НЕ РАНЬШЕ after_timestamp (для первого хопа —
-    время прихода моста; для следующих — время предыдущего хопа). Без этого
-    ограничения по времени можно случайно выбрать перевод, который физически
-    произошёл ДО того, как средства вообще пришли на адрес — обнаружено
-    живым запуском в этой сессии: реальный адрес-получатель оказался
-    высокоактивным (свежий исходящий перевод примерно раз в 15-20 минут), и
-    без time-фильтра "последний элемент страницы" оказался переводом за
-    несколько дней ДО прихода трейсящихся средств — очевидно неверным. Это
-    НЕ amount-aware taint-трейсинг (см. ограничения в docstring модуля) —
-    просто "первое, что случилось после" по времени, без учёта суммы.
+    Один хоп = САМЫЙ РАННИЙ исходящий перевод СРЕДИ ПОДХОДЯЩИХ, случившийся
+    НЕ РАНЬШЕ after_timestamp (для первого хопа — время прихода моста; для
+    следующих — время предыдущего хопа). Без этого ограничения по времени
+    можно случайно выбрать перевод, который физически произошёл ДО того, как
+    средства вообще пришли на адрес — обнаружено живым запуском в этой
+    сессии: реальный адрес-получатель оказался высокоактивным (свежий
+    исходящий перевод примерно раз в 15-20 минут), и без time-фильтра
+    "последний элемент страницы" оказался переводом за несколько дней ДО
+    прихода трейсящихся средств — очевидно неверным. Это НЕ amount-aware
+    taint-трейсинг (см. ограничения в docstring модуля) — просто "первое,
+    что случилось после" по времени, без учёта суммы.
 
-    Известное ограничение: если после after_timestamp у адреса было больше
-    MAX_EVM_TRANSFERS_PER_PAGE исходящих ERC-20 переводов ДО следующего
-    релевантного, страница может не дотянуться — тогда это ошибочно
-    прочитается как RESTED_AT_ADDRESS (тупик), хотя на самом деле просто не
-    хватило глубины одной страницы. Для MVP не пагинируется дальше одной
-    страницы (см. max_branch-ограничение с тем же компромиссом в
-    aml/flow_tracer/hop_tracer.py).
+    ПАГИНАЦИЯ (до max_pages_per_hop страниц НА ОДИН ХОП)
+    -----------------------------------------------------
+    Blockscout отдаёт страницу по убыванию времени (свежие первыми) — то
+    есть более поздние страницы содержат БОЛЕЕ СТАРЫЕ переводы. Если на
+    текущей странице после time-фильтра не осталось ни одного подходящего
+    кандидата — переходим к следующей странице через cursor (next_page_params
+    предыдущего ответа), а не сразу сдаёмся на RESTED_AT_ADDRESS. Как только
+    на КАКОЙ-ТО странице находится хотя бы один подходящий кандидат —
+    дальнейшие страницы для этого хопа не запрашиваются: "самый ранний
+    подходящий на этой странице" побеждает, даже если на более старой
+    странице (которую мы уже не смотрим) мог бы найтись кандидат с ещё более
+    ранним временем, ведущий на известный адрес — приоритет "это, вероятно,
+    прямое продолжение именно этих денег" выше, чем удобство найти
+    терминальный статус пораньше (см. следующий абзац и тест
+    test_walk_evm_prefers_earliest_over_known_address_match).
+
+    Известный кандидат (проверка ПОСЛЕ выбора, не вместо него)
+    -------------------------------------------------------------
+    Как только "самый ранний подходящий" кандидат выбран на своей странице,
+    его АДРЕС-ПОЛУЧАТЕЛЬ (не все кандидаты страницы!) сверяется с реестрами
+    известных адресов (см. _known_evm_label — known_contracts.py +
+    bridge_registry.py). Если известен — это финальный хоп сразу здесь (без
+    лишней итерации цикла на "текущий = известный адрес" — тот же итог, что
+    и раньше, просто без одного лишнего прохода). Если неизвестен — обычное
+    продолжение обхода. Реестр НЕ влияет на то, какой кандидат выбирается
+    (это делает только time-anchoring) — только на то, останавливаемся мы
+    на нём или продолжаем.
+
+    Если после max_pages_per_hop страниц НИ на одной не нашлось подходящего
+    кандидата, но у Blockscout ещё оставались более старые страницы (последняя
+    просмотренная страница имела непустой next_page_params) — это
+    SEARCH_DEPTH_EXCEEDED, а НЕ RESTED_AT_ADDRESS: не хватило глубины
+    поиска, а не "дальше правда некуда идти" (тот второй случай — когда
+    Blockscout сам подтвердил конец данных, next_page_params пуст, до
+    исчерпания max_pages_per_hop). Различие важно: тихий ложный тупик хуже
+    честного "не досмотрели".
     """
     hops: list[dict[str, Any]] = []
     current = start_address
     current_tx_hash: Optional[str] = None
     not_before = after_timestamp
 
+    try:
+        registry_entries = await asyncio.to_thread(bridge_registry.get_registry_for_evm_chain_id, chain_id)
+    except Exception:
+        registry_entries = []  # USDT0 Deployments API недоступен — деградация до known_contracts.py-only
+    registry_by_address = {e["address"].lower(): e for e in registry_entries}
+
     for hop_number in range(1, max_hops + 1):
-        label = lookup_contract(chain_id, current)
+        label = _known_evm_label(chain_id, current, registry_by_address)
         if label is not None:
             status = "RESTED_AT_EXCHANGE" if label["type"] == "exchange" else "RESTED_AT_CONTRACT"
             return {"hops": hops, "final_status": status, "final_address": current,
                     "final_tx_hash": current_tx_hash, "label": label}
 
-        page = await get_token_transfers(
-            chain_id=chain_id, address=current, token_standard="ERC-20", limit=MAX_EVM_TRANSFERS_PER_PAGE,
-        )
-        outgoing = [
-            item for item in page.get("items", [])
-            if ((item.get("from") or {}).get("hash") or "").lower() == current.lower()
-        ]
-        if not_before is not None:
+        next_transfer = None
+        cursor: Optional[dict[str, Any]] = None
+        pages_fetched = 0
+        hit_natural_end = False
+        while pages_fetched < max_pages_per_hop:
+            page = await get_token_transfers(
+                chain_id=chain_id, address=current, token_standard="ERC-20",
+                limit=MAX_EVM_TRANSFERS_PER_PAGE, cursor=cursor,
+            )
+            pages_fetched += 1
             outgoing = [
-                item for item in outgoing
-                if (ts := _parse_iso_timestamp(item.get("timestamp"))) is not None and ts >= not_before
+                item for item in page.get("items", [])
+                if ((item.get("from") or {}).get("hash") or "").lower() == current.lower()
             ]
-        if not outgoing:
-            return {"hops": hops, "final_status": "RESTED_AT_ADDRESS", "final_address": current,
-                    "final_tx_hash": current_tx_hash, "label": None}
+            if not_before is not None:
+                outgoing = [
+                    item for item in outgoing
+                    if (ts := _parse_iso_timestamp(item.get("timestamp"))) is not None and ts >= not_before
+                ]
+            if outgoing:
+                # Самый ранний среди подходящих (после time-фильтра подмножество
+                # может быть не строго упорядочено с "последним элементом = самым ранним").
+                next_transfer = min(outgoing, key=lambda it: _parse_iso_timestamp(it.get("timestamp")) or float("inf"))
+                break
 
-        # Самый ранний среди подходящих (Blockscout отдаёт страницу по
-        # убыванию времени, но после time-фильтра подмножество может быть
-        # не строго упорядочено с "последним элементом = самым ранним").
-        next_transfer = min(outgoing, key=lambda it: _parse_iso_timestamp(it.get("timestamp")) or float("inf"))
+            next_cursor = page.get("next_page_params")
+            if not next_cursor:
+                hit_natural_end = True
+                break
+            cursor = next_cursor
+
+        if next_transfer is None:
+            if hit_natural_end:
+                return {"hops": hops, "final_status": "RESTED_AT_ADDRESS", "final_address": current,
+                        "final_tx_hash": current_tx_hash, "label": None}
+            return {
+                "hops": hops, "final_status": "SEARCH_DEPTH_EXCEEDED", "final_address": current,
+                "final_tx_hash": current_tx_hash, "label": None, "pages_examined": pages_fetched,
+                "note": (
+                    f"Не хватило глубины поиска: просмотрено {pages_fetched} страниц(ы) Blockscout "
+                    f"(лимит max_pages_per_hop={max_pages_per_hop}), ни на одной не нашлось исходящего "
+                    "перевода не раньше времени прихода средств — но у Blockscout ещё оставались более "
+                    "старые страницы (next_page_params не был пуст на последней просмотренной). Это НЕ "
+                    "означает тупик — увеличьте max_pages_per_hop, если нужно досмотреть глубже."
+                ),
+            }
+
         to_addr = (next_transfer.get("to") or {}).get("hash")
         if to_addr is None:
             # напр. burn/контракт без явного получателя — дальше трейсить некуда
@@ -613,6 +710,16 @@ async def _walk_evm(
             "value_decimals": total.get("decimals"),
             "timestamp": next_transfer.get("timestamp"),
         })
+
+        # Проверка ПОСЛЕ выбора кандидата (см. докстринг функции) — тот же
+        # итог, что дал бы top-of-loop label-чек на следующей итерации (см.
+        # выше), просто на один проход раньше и без лишнего API-запроса.
+        arrival_label = _known_evm_label(chain_id, to_addr, registry_by_address)
+        if arrival_label is not None:
+            status = "RESTED_AT_EXCHANGE" if arrival_label["type"] == "exchange" else "RESTED_AT_CONTRACT"
+            return {"hops": hops, "final_status": status, "final_address": to_addr,
+                    "final_tx_hash": tx_hash, "label": arrival_label}
+
         current = to_addr
         current_tx_hash = tx_hash
         not_before = _parse_iso_timestamp(next_transfer.get("timestamp"))
