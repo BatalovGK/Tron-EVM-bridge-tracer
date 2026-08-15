@@ -58,7 +58,7 @@ python3 layerzero_tracer.py --tx <хэш транзакции LayerZero>
 pytest -v --ignore=aml/common/tests --ignore=aml/attribution/tests/test_service.py
 ```
 
-114 тестов должны пройти. Два указанных исключения — тесты `aml/common/`
+116 тестов должны пройти. Два указанных исключения — тесты `aml/common/`
 и `attribution/test_service.py` — идут против настоящего PostgreSQL
 (`POSTGRES_DSN`), к трейсеру не относятся и в этом задании не поднимаются;
 остальные тесты выполняются полностью офлайн (все внешние API замоканы на
@@ -87,6 +87,12 @@ bridge_registry.py         — generic Bridge Contract Registry (адрес -> �
                               протокол/тип/источник+дата), официальные записи
                               из USDT0 Deployments API + эмпирически
                               подтверждённые вручную (pool/router-контракты)
+observed_name_tags.py      — persistent write-through кэш самоуказанных
+                              имён адресов (TronGrid account_name / Blockscout
+                              Pro name у verified-контрактов) — ЧИСТО
+                              информационно, не влияет на маршрут/стоп-условия
+                              (см. докстринг модуля, почему это разделено с
+                              known_contracts.py/bridge_registry.py)
 layerzero_tracer.py        — сопоставитель одного сообщения LayerZero
                               (source ↔ destination), декодирование
                               реального получателя из OFT-payload,
@@ -95,7 +101,7 @@ usdt0_deployments.py       — живой (с диск-кэшем на 24ч) к�
                               официальному USDT0 Deployments API
 known_contracts.py         — статический реестр меток (биржи/DEX/мосты)
                               для стоп-условий пост-bridge обхода
-test_bridge_tracer.py      — офлайн-тесты trace_full_path() (25 сценариев)
+test_bridge_tracer.py      — офлайн-тесты trace_full_path() (27 сценариев)
 test_layerzero_tracer.py   — офлайн-тесты find_bridge_crossing()
 aml/                       — переиспользуемая часть основной AML-платформы
   evm_adapter/                клиент к Blockscout Pro (rate limiting, кэш)
@@ -154,6 +160,15 @@ briefing_for_claude_code.md — журнал разработки для пер�
   ЛЮБОГО запроса на этой сети, не единичный случай одного адреса.
 - **Второй мост или DEX-своп на пути не резолвится** — трейсер корректно
   останавливается на нём (`RESTED_AT_CONTRACT`), а не идёт дальше.
+- **`observed_name`/`observed_name_source` в результате** — самоуказанное
+  имя адреса (TronGrid `account_name` для депозитора, Blockscout Pro
+  `name` для verified-контрактов на финальном EVM-адресе), с persistent
+  write-through кэшем (`observed_name_tags.py`). Проверено живым запросом:
+  ни Blockscout Pro (`public_tags`), ни TronGrid/Tronscan не отдают
+  МОДЕРИРУЕМУЮ бизнес-категоризацию (биржа/мост/DEX) программно — только
+  самоуказанные имена, которые НЕ используются как основание для
+  стоп-условия (сознательное решение — самоуказанное имя можно подделать,
+  небезопасно для комплаенс-инструмента; см. докстринг модуля).
 - **`aml/evm_adapter/config/chains.yaml` не покрывает все сети**, куда может
   прийти USDT0 (сконфигурированы: Ethereum, BNB Chain, Polygon, Arbitrum,
   Optimism, Base). На неконфигурированной сети `_walk_evm()` падает с понятной

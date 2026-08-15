@@ -98,9 +98,10 @@ if _AML_DIR not in sys.path:
 
 import layerzero_tracer as lz  # noqa: E402
 import bridge_registry  # noqa: E402
+import observed_name_tags  # noqa: E402
 from known_contracts import lookup_contract  # noqa: E402
-from tron_adapter import base58_to_hex, get_trc20_transfers, close_client as _close_tron_client  # noqa: E402
-from evm_adapter import get_token_transfers, close_client as _close_evm_client  # noqa: E402
+from tron_adapter import base58_to_hex, get_trc20_transfers, get_account_info as get_tron_account_info, close_client as _close_tron_client  # noqa: E402
+from evm_adapter import get_token_transfers, get_address_info, close_client as _close_evm_client  # noqa: E402
 from usdt0_deployments import get_tron_oft_contracts  # noqa: E402
 
 DEFAULT_MAX_HOPS = 10
@@ -307,6 +308,8 @@ async def trace_full_path(
         contract_label=contract_label,
         contract_type=contract_type,
         note=walk.get("note"),
+        observed_name=walk.get("observed_name"),
+        observed_name_source=walk.get("observed_name_source"),
     )
 
 
@@ -411,20 +414,23 @@ async def _find_tron_bridge_deposit_via_trongrid(tron_address: str) -> Optional[
         tx_hash = raw_tx_hash if raw_tx_hash.startswith("0x") else "0x" + raw_tx_hash
 
         block_ts = item.get("block_timestamp")  # TronGrid отдаёт unix ms
-        return {
+        depositor = item.get("from")
+        hop: dict[str, Any] = {
+            "segment": "tron_deposit",
+            "chain": "Tron",
+            "from_address": depositor,
+            "oapp": entry["contract_role"],
             "tx_hash": tx_hash,
-            "hop": {
-                "segment": "tron_deposit",
-                "chain": "Tron",
-                "from_address": item.get("from"),
-                "oapp": entry["contract_role"],
-                "tx_hash": tx_hash,
-                "timestamp": block_ts // 1000 if isinstance(block_ts, int) else None,
-                "detection_method": "trongrid_registry_match",
-                "registry_entry_type": entry["type"],
-                "registry_source": entry["source"],
-            },
+            "timestamp": block_ts // 1000 if isinstance(block_ts, int) else None,
+            "detection_method": "trongrid_registry_match",
+            "registry_entry_type": entry["type"],
+            "registry_source": entry["source"],
         }
+        observed = await _annotate_tron_observed_name(depositor) if depositor else None
+        if observed is not None:
+            hop["from_address_observed_name"] = observed["name"]
+            hop["from_address_observed_name_source"] = observed["source"]
+        return {"tx_hash": tx_hash, "hop": hop}
     return None
 
 
@@ -475,18 +481,21 @@ async def _find_tron_bridge_deposit_via_layerzero_scan(tron_address: str) -> Opt
         if not tx_hash:
             continue
 
-        return {
+        depositor = source_tx.get("from")
+        hop: dict[str, Any] = {
+            "segment": "tron_deposit",
+            "chain": "Tron",
+            "from_address": depositor,
+            "oapp": oapp_name,
             "tx_hash": tx_hash,
-            "hop": {
-                "segment": "tron_deposit",
-                "chain": "Tron",
-                "from_address": source_tx.get("from"),
-                "oapp": oapp_name,
-                "tx_hash": tx_hash,
-                "timestamp": source_tx.get("blockTimestamp"),
-                "detection_method": "layerzero_scan_wallet_fallback",
-            },
+            "timestamp": source_tx.get("blockTimestamp"),
+            "detection_method": "layerzero_scan_wallet_fallback",
         }
+        observed = await _annotate_tron_observed_name(depositor) if depositor else None
+        if observed is not None:
+            hop["from_address_observed_name"] = observed["name"]
+            hop["from_address_observed_name_source"] = observed["source"]
+        return {"tx_hash": tx_hash, "hop": hop}
     return None
 
 
@@ -499,6 +508,66 @@ def _parse_iso_timestamp(ts: Optional[str]) -> Optional[float]:
         return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
     except ValueError:
         return None
+
+
+async def _annotate_evm_observed_name(chain_id: int, address: str) -> Optional[dict[str, Any]]:
+    """
+    Читает/пишет observed_name_tags.py для EVM-адреса — Blockscout Pro
+    `get_address_info().name`, заполняется ТОЛЬКО для verified-контрактов
+    (см. докстринг observed_name_tags.py, почему это не используется как
+    основание для стоп-условия). Кэш-хит не делает сетевого запроса вовсе.
+    """
+    chain_key = f"evm:{chain_id}"
+    cached = observed_name_tags.get_cached(chain_key, address)
+    if cached is not None:
+        return cached
+    try:
+        info = await get_address_info(chain_id=chain_id, address=address)
+    except Exception:
+        return None  # не критично — аннотация информационная, best-effort
+    name = info.get("name")
+    if not name:
+        return None
+    return observed_name_tags.write_through(chain_key, address, name, observed_name_tags.SOURCE_BLOCKSCOUT)
+
+
+async def _annotate_tron_observed_name(address: str) -> Optional[dict[str, Any]]:
+    """
+    То же самое для Tron — TronGrid `get_account_info().data[0].account_name`
+    (hex-encoded on-chain имя аккаунта, см. observed_name_tags.py)."""
+    chain_key = "tron"
+    cached = observed_name_tags.get_cached(chain_key, address)
+    if cached is not None:
+        return cached
+    try:
+        info = await get_tron_account_info(address)
+    except Exception:
+        return None
+    accounts = info.get("data") or []
+    raw_name = accounts[0].get("account_name") if accounts else None
+    if not raw_name:
+        return None
+    try:
+        name = bytes.fromhex(raw_name).decode("utf-8", errors="replace")
+    except ValueError:
+        return None
+    if not name:
+        return None
+    return observed_name_tags.write_through(chain_key, address, name, observed_name_tags.SOURCE_TRONGRID)
+
+
+async def _with_observed_evm_name(result: dict[str, Any], chain_id: int) -> dict[str, Any]:
+    """Аннотирует result['final_address'] самоуказанным именем — ТОЛЬКО
+    когда у результата нет курируемой метки (result['label'] is None, т.е.
+    RESTED_AT_ADDRESS/MAX_HOPS_REACHED/SEARCH_DEPTH_EXCEEDED). Чисто
+    информационно — final_status не меняется."""
+    if result.get("label") is not None or result.get("final_address") is None:
+        return result
+    observed = await _annotate_evm_observed_name(chain_id, result["final_address"])
+    if observed is not None:
+        result["observed_name"] = observed["name"]
+        result["observed_name_source"] = observed["source"]
+    return result
 
 
 def _known_evm_label(
@@ -639,25 +708,34 @@ async def _walk_evm(
 
         if next_transfer is None:
             if hit_natural_end:
-                return {"hops": hops, "final_status": "RESTED_AT_ADDRESS", "final_address": current,
-                        "final_tx_hash": current_tx_hash, "label": None}
-            return {
-                "hops": hops, "final_status": "SEARCH_DEPTH_EXCEEDED", "final_address": current,
-                "final_tx_hash": current_tx_hash, "label": None, "pages_examined": pages_fetched,
-                "note": (
-                    f"Не хватило глубины поиска: просмотрено {pages_fetched} страниц(ы) Blockscout "
-                    f"(лимит max_pages_per_hop={max_pages_per_hop}), ни на одной не нашлось исходящего "
-                    "перевода не раньше времени прихода средств — но у Blockscout ещё оставались более "
-                    "старые страницы (next_page_params не был пуст на последней просмотренной). Это НЕ "
-                    "означает тупик — увеличьте max_pages_per_hop, если нужно досмотреть глубже."
-                ),
-            }
+                return await _with_observed_evm_name(
+                    {"hops": hops, "final_status": "RESTED_AT_ADDRESS", "final_address": current,
+                     "final_tx_hash": current_tx_hash, "label": None},
+                    chain_id,
+                )
+            return await _with_observed_evm_name(
+                {
+                    "hops": hops, "final_status": "SEARCH_DEPTH_EXCEEDED", "final_address": current,
+                    "final_tx_hash": current_tx_hash, "label": None, "pages_examined": pages_fetched,
+                    "note": (
+                        f"Не хватило глубины поиска: просмотрено {pages_fetched} страниц(ы) Blockscout "
+                        f"(лимит max_pages_per_hop={max_pages_per_hop}), ни на одной не нашлось исходящего "
+                        "перевода не раньше времени прихода средств — но у Blockscout ещё оставались более "
+                        "старые страницы (next_page_params не был пуст на последней просмотренной). Это НЕ "
+                        "означает тупик — увеличьте max_pages_per_hop, если нужно досмотреть глубже."
+                    ),
+                },
+                chain_id,
+            )
 
         to_addr = (next_transfer.get("to") or {}).get("hash")
         if to_addr is None:
             # напр. burn/контракт без явного получателя — дальше трейсить некуда
-            return {"hops": hops, "final_status": "RESTED_AT_ADDRESS", "final_address": current,
-                    "final_tx_hash": current_tx_hash, "label": None}
+            return await _with_observed_evm_name(
+                {"hops": hops, "final_status": "RESTED_AT_ADDRESS", "final_address": current,
+                 "final_tx_hash": current_tx_hash, "label": None},
+                chain_id,
+            )
 
         tx_hash = next_transfer.get("transaction_hash")
 
@@ -724,8 +802,11 @@ async def _walk_evm(
         current_tx_hash = tx_hash
         not_before = _parse_iso_timestamp(next_transfer.get("timestamp"))
 
-    return {"hops": hops, "final_status": "MAX_HOPS_REACHED", "final_address": current,
-            "final_tx_hash": current_tx_hash, "label": None}
+    return await _with_observed_evm_name(
+        {"hops": hops, "final_status": "MAX_HOPS_REACHED", "final_address": current,
+         "final_tx_hash": current_tx_hash, "label": None},
+        chain_id,
+    )
 
 
 def _label_fields(label: Optional[dict[str, Any]]) -> tuple[Optional[str], Optional[str], Optional[str]]:
@@ -746,6 +827,8 @@ def _flat_result(
     contract_label: Optional[str] = None,
     contract_type: Optional[str] = None,
     note: Optional[str] = None,
+    observed_name: Optional[str] = None,
+    observed_name_source: Optional[str] = None,
 ) -> dict[str, Any]:
     return {
         "final_status": final_status,
@@ -757,6 +840,12 @@ def _flat_result(
         "contract_type": contract_type,
         "hops": hops,
         "note": note,
+        # Самоуказанное имя адреса (Blockscout Pro `name`, только verified-
+        # контракты) — ИНФОРМАЦИОННО, не влияет на final_status/маршрут, не
+        # то же самое, что contract_label (курируемая метка). См.
+        # observed_name_tags.py, почему разделены.
+        "observed_name": observed_name,
+        "observed_name_source": observed_name_source,
     }
 
 

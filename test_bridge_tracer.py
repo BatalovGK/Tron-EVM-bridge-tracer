@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import bridge_tracer as bt
+import observed_name_tags
 
 USDT0_OFT_TRON = "TFG4wBaDQ8sHWWP1ACeSGnoNR6RRzevLPt"
 USDT0_OFT_HEX = "0x" + bt.base58_to_hex(USDT0_OFT_TRON)
@@ -129,7 +130,8 @@ DEFAULT_TRON_REGISTRY = [
 
 
 def _patched(wallet_messages=None, crossing=None, evm_pages=None, tron_contracts=None,
-             tron_registry=None, tron_trc20_transfers=None, evm_registry=None):
+             tron_registry=None, tron_trc20_transfers=None, evm_registry=None,
+             tron_account_info=None, evm_address_info=None):
     """
     evm_pages: dict address(lower) -> {"items": [...]} (одна страница,
         поведение как раньше — cursor игнорируется, всегда одна и та же
@@ -158,6 +160,10 @@ def _patched(wallet_messages=None, crossing=None, evm_pages=None, tron_contracts
     evm_registry: список записей bridge_registry.get_registry_for_evm_chain_id()
         (по умолчанию — [], то есть _walk_evm сверяется только с
         known_contracts.py, как и раньше — существующие тесты не требуют правки).
+    tron_account_info / evm_address_info: сырые ответы get_account_info()/
+        get_address_info() для observed_name_tags-аннотации (по умолчанию —
+        без account_name/name, то есть аннотация ничего не находит и не
+        пишет в persistent-кэш — существующие тесты не требуют правки).
     """
     m_wallet = MagicMock(return_value=wallet_messages if wallet_messages is not None else [])
     m_tron_contracts = MagicMock(
@@ -167,6 +173,12 @@ def _patched(wallet_messages=None, crossing=None, evm_pages=None, tron_contracts
     m_evm_registry = MagicMock(return_value=evm_registry if evm_registry is not None else [])
     m_trc20 = AsyncMock(
         return_value=tron_trc20_transfers if tron_trc20_transfers is not None else {"data": [], "success": True}
+    )
+    m_tron_account_info = AsyncMock(
+        return_value=tron_account_info if tron_account_info is not None else {"data": [{}], "success": True}
+    )
+    m_evm_address_info = AsyncMock(
+        return_value=evm_address_info if evm_address_info is not None else {"name": None, "public_tags": []}
     )
 
     if isinstance(crossing, dict) and "found" not in crossing:
@@ -196,17 +208,19 @@ def _patched(wallet_messages=None, crossing=None, evm_pages=None, tron_contracts
         patch.object(bt, "get_tron_oft_contracts", m_tron_contracts), \
         patch.object(bt.bridge_registry, "get_registry_for_tron", m_tron_registry), \
         patch.object(bt.bridge_registry, "get_registry_for_evm_chain_id", m_evm_registry), \
-        patch.object(bt, "get_trc20_transfers", m_trc20)
+        patch.object(bt, "get_trc20_transfers", m_trc20), \
+        patch.object(bt, "get_tron_account_info", m_tron_account_info), \
+        patch.object(bt, "get_address_info", m_evm_address_info)
 
 
 def test_full_path_rests_at_exchange():
     recipient = BINANCE_ETH
-    p1, p2, p3, p4, p5, p6, p7 = _patched(
+    p1, p2, p3, p4, p5, p6, p7, p8, p9 = _patched(
         wallet_messages=_wallet_messages_response(),
         crossing=_crossing_delivered(to_address=recipient),
         evm_pages={},
     )
-    with p1, p2, p3, p4, p5, p6, p7:
+    with p1, p2, p3, p4, p5, p6, p7, p8, p9:
         result = _run(bt.trace_full_path(TRON_SENDER, start_type="address"))
 
     assert result["final_status"] == "RESTED_AT_EXCHANGE"
@@ -221,12 +235,12 @@ def test_full_path_rests_at_exchange():
 
 def test_full_path_rests_at_dex_contract():
     recipient = "0x1111111111111111111111111111111111111a"
-    p1, p2, p3, p4, p5, p6, p7 = _patched(
+    p1, p2, p3, p4, p5, p6, p7, p8, p9 = _patched(
         wallet_messages=_wallet_messages_response(),
         crossing=_crossing_delivered(to_address=recipient),
         evm_pages={recipient: {"items": [_evm_transfer_item(recipient, UNISWAP_ETH)]}},
     )
-    with p1, p2, p3, p4, p5, p6, p7:
+    with p1, p2, p3, p4, p5, p6, p7, p8, p9:
         result = _run(bt.trace_full_path(TRON_SENDER))
 
     assert result["final_status"] == "RESTED_AT_CONTRACT"
@@ -239,12 +253,12 @@ def test_full_path_rests_at_dex_contract():
 
 def test_full_path_dead_end():
     recipient = "0x2222222222222222222222222222222222222b"
-    p1, p2, p3, p4, p5, p6, p7 = _patched(
+    p1, p2, p3, p4, p5, p6, p7, p8, p9 = _patched(
         wallet_messages=_wallet_messages_response(),
         crossing=_crossing_delivered(to_address=recipient),
         evm_pages={},  # no outgoing transfers anywhere -> immediate dead end
     )
-    with p1, p2, p3, p4, p5, p6, p7:
+    with p1, p2, p3, p4, p5, p6, p7, p8, p9:
         result = _run(bt.trace_full_path(TRON_SENDER))
 
     assert result["final_status"] == "RESTED_AT_ADDRESS"
@@ -262,12 +276,12 @@ def test_full_path_max_hops_reached():
     # last address also has an outgoing transfer, to guarantee max_hops (not dead end) triggers first
     pages[addrs[-1]] = {"items": [_evm_transfer_item(addrs[-1], "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef")]}
 
-    p1, p2, p3, p4, p5, p6, p7 = _patched(
+    p1, p2, p3, p4, p5, p6, p7, p8, p9 = _patched(
         wallet_messages=_wallet_messages_response(),
         crossing=_crossing_delivered(to_address=recipient),
         evm_pages=pages,
     )
-    with p1, p2, p3, p4, p5, p6, p7:
+    with p1, p2, p3, p4, p5, p6, p7, p8, p9:
         result = _run(bt.trace_full_path(TRON_SENDER, max_hops=3))
 
     assert result["final_status"] == "MAX_HOPS_REACHED"
@@ -289,12 +303,12 @@ def test_full_path_stops_on_same_tx_multi_leg_swap():
         addr_a: {"items": [_evm_transfer_item(addr_a, addr_b, tx_hash=shared_tx)]},
         addr_b: {"items": [_evm_transfer_item(addr_b, addr_a, tx_hash=shared_tx)]},
     }
-    p1, p2, p3, p4, p5, p6, p7 = _patched(
+    p1, p2, p3, p4, p5, p6, p7, p8, p9 = _patched(
         wallet_messages=_wallet_messages_response(),
         crossing=_crossing_delivered(to_address=recipient),
         evm_pages=pages,
     )
-    with p1, p2, p3, p4, p5, p6, p7:
+    with p1, p2, p3, p4, p5, p6, p7, p8, p9:
         result = _run(bt.trace_full_path(TRON_SENDER, max_hops=10))
 
     assert result["final_status"] == "RESTED_AT_CONTRACT"
@@ -314,12 +328,12 @@ def test_full_path_stops_on_burn_to_zero_address():
     recipient = "0x4444444444444444444444444444444444444d"
     zero = "0x" + "0" * 40
     pages = {recipient: {"items": [_evm_transfer_item(recipient, zero, tx_hash="0xburn1")]}}
-    p1, p2, p3, p4, p5, p6, p7 = _patched(
+    p1, p2, p3, p4, p5, p6, p7, p8, p9 = _patched(
         wallet_messages=_wallet_messages_response(),
         crossing=_crossing_delivered(to_address=recipient),
         evm_pages=pages,
     )
-    with p1, p2, p3, p4, p5, p6, p7:
+    with p1, p2, p3, p4, p5, p6, p7, p8, p9:
         result = _run(bt.trace_full_path(TRON_SENDER, max_hops=10))
 
     assert result["final_status"] == "RESTED_AT_ADDRESS"
@@ -339,12 +353,12 @@ def test_tron_deposit_uses_real_sender_not_shared_oapp_address():
     независимо от того, сколько промежуточных router-контрактов было между
     ним и OApp (это и была причина ложноотрицательного NO_BRIDGE_DEPOSIT_FOUND
     на реальном Tron -> Arbitrum переводе)."""
-    p1, p2, p3, p4, p5, p6, p7 = _patched(
+    p1, p2, p3, p4, p5, p6, p7, p8, p9 = _patched(
         wallet_messages=_wallet_messages_response(sender_hex=USDT0_OFT_HEX, from_hex=TRON_SENDER_HEX),
         crossing=_crossing_delivered(),
         evm_pages={},
     )
-    with p1, p2, p3, p4, p5, p6, p7:
+    with p1, p2, p3, p4, p5, p6, p7, p8, p9:
         result = _run(bt.trace_full_path(TRON_SENDER))
 
     deposit_hop = result["hops"][0]
@@ -362,13 +376,13 @@ def test_tron_deposit_found_via_trongrid_official_oft():
     LayerZero Scan messages/wallet (fallback вообще не должен вызываться —
     TronGrid быстрее и является приоритетным путём)."""
     trongrid_tx = "0xtrongridtx1"
-    p1, p2, p3, p4, p5, p6, p7 = _patched(
+    p1, p2, p3, p4, p5, p6, p7, p8, p9 = _patched(
         wallet_messages=None,  # не должен быть вызван — TronGrid находит депозит первым
         crossing=_crossing_delivered(),
         evm_pages={},
         tron_trc20_transfers={"data": [_tron_transfer_item(TRON_SENDER, USDT0_OFT_TRON, trongrid_tx)]},
     )
-    with p1, p2, p3, p4, p5, p6, p7:
+    with p1, p2, p3, p4, p5, p6, p7, p8, p9:
         result = _run(bt.trace_full_path(TRON_SENDER))
         bt.lz.find_messages_by_wallet.assert_not_called()
 
@@ -390,13 +404,13 @@ def test_tron_deposit_found_via_trongrid_pool_router():
     в bridge_registry.py)."""
     trongrid_tx = "0xtrongridtx2"
     pool_router = "TWPziSAroSacAjDuL52ByQzU86s9mP2gPr"
-    p1, p2, p3, p4, p5, p6, p7 = _patched(
+    p1, p2, p3, p4, p5, p6, p7, p8, p9 = _patched(
         wallet_messages=None,  # не должен быть вызван
         crossing=_crossing_delivered(),
         evm_pages={},
         tron_trc20_transfers={"data": [_tron_transfer_item(TRON_SENDER, pool_router, trongrid_tx)]},
     )
-    with p1, p2, p3, p4, p5, p6, p7:
+    with p1, p2, p3, p4, p5, p6, p7, p8, p9:
         result = _run(bt.trace_full_path(TRON_SENDER))
         bt.lz.find_messages_by_wallet.assert_not_called()
 
@@ -413,7 +427,7 @@ def test_trongrid_miss_falls_back_to_layerzero_scan():
     (например, перевод через ещё не размеченный router-контракт), должен
     сработать fallback на LayerZero Scan messages/wallet — тот путь, который
     был единственным механизмом до появления TronGrid-пути (см. историю)."""
-    p1, p2, p3, p4, p5, p6, p7 = _patched(
+    p1, p2, p3, p4, p5, p6, p7, p8, p9 = _patched(
         wallet_messages=_wallet_messages_response(),
         crossing=_crossing_delivered(),
         evm_pages={},
@@ -421,7 +435,7 @@ def test_trongrid_miss_falls_back_to_layerzero_scan():
             _tron_transfer_item(TRON_SENDER, "TSomeUnknownRouterNotInRegistry1111", "0xnotmatching")
         ]},
     )
-    with p1, p2, p3, p4, p5, p6, p7:
+    with p1, p2, p3, p4, p5, p6, p7, p8, p9:
         result = _run(bt.trace_full_path(TRON_SENDER))
         bt.lz.find_messages_by_wallet.assert_called_once()
 
@@ -437,12 +451,12 @@ def test_trongrid_error_falls_back_to_layerzero_scan():
     async def _raise(*a, **kw):
         raise RuntimeError("TronGrid недоступен (симулировано в тесте)")
 
-    p1, p2, p3, p4, p5, p6, p7 = _patched(
+    p1, p2, p3, p4, p5, p6, p7, p8, p9 = _patched(
         wallet_messages=_wallet_messages_response(),
         crossing=_crossing_delivered(),
         evm_pages={},
     )
-    with p1, p2, p3, p4, p5, p6, p7:
+    with p1, p2, p3, p4, p5, p6, p7, p8, p9:
         bt.get_trc20_transfers.side_effect = _raise
         result = _run(bt.trace_full_path(TRON_SENDER))
 
@@ -454,12 +468,12 @@ def test_unknown_oapp_sender_treated_as_no_deposit():
     """Сообщение от адреса есть, но через OApp вне реестра
     TRON_BRIDGE_DEPOSIT_CONTRACTS (не USDT0) — вне scope MVP, должно
     читаться как отсутствие депозита, а не ложное совпадение."""
-    p1, p2, p3, p4, p5, p6, p7 = _patched(
+    p1, p2, p3, p4, p5, p6, p7, p8, p9 = _patched(
         wallet_messages=_wallet_messages_response(sender_hex="0x" + "ab" * 20),
         crossing=_crossing_delivered(),
         evm_pages={},
     )
-    with p1, p2, p3, p4, p5, p6, p7:
+    with p1, p2, p3, p4, p5, p6, p7, p8, p9:
         result = _run(bt.trace_full_path(TRON_SENDER))
 
     assert result["final_status"] == "NO_BRIDGE_DEPOSIT_FOUND"
@@ -471,8 +485,8 @@ def test_incoming_message_to_tron_not_mistaken_for_deposit():
     Tron (destination с другой сети), а не отправитель. srcEid != 30420
     должен быть отфильтрован, а не принят за исходящий депозит."""
     incoming = _wallet_messages_response(src_eid=30101)  # Ethereum -> Tron
-    p1, p2, p3, p4, p5, p6, p7 = _patched(wallet_messages=incoming, crossing=_crossing_delivered(), evm_pages={})
-    with p1, p2, p3, p4, p5, p6, p7:
+    p1, p2, p3, p4, p5, p6, p7, p8, p9 = _patched(wallet_messages=incoming, crossing=_crossing_delivered(), evm_pages={})
+    with p1, p2, p3, p4, p5, p6, p7, p8, p9:
         result = _run(bt.trace_full_path(TRON_SENDER))
 
     assert result["final_status"] == "NO_BRIDGE_DEPOSIT_FOUND"
@@ -512,12 +526,12 @@ def test_full_path_chases_legacy_mesh_hop2():
     hop2_crossing["bridge_exit"]["chain"] = "Ethereum"
     hop2_crossing["bridge_exit"]["eid"] = 30101
 
-    p1, p2, p3, p4, p5, p6, p7 = _patched(
+    p1, p2, p3, p4, p5, p6, p7, p8, p9 = _patched(
         wallet_messages=_wallet_messages_response(tx_hash=hop1_tx),
         crossing={hop1_tx: hop1_crossing, hop2_tx: hop2_crossing},
         evm_pages={},  # final_recipient has no outgoing transfers -> dead end after arrival
     )
-    with p1, p2, p3, p4, p5, p6, p7:
+    with p1, p2, p3, p4, p5, p6, p7, p8, p9:
         result = _run(bt.trace_full_path(TRON_SENDER))
 
     bridge_hops = [h for h in result["hops"] if h["segment"] == "bridge"]
@@ -543,8 +557,8 @@ def test_bridge_hop_chase_capped_at_max_bridge_hops():
         c["bridge_exit"]["compose_tx_hash"] = f"0xhop{len(call_log) + 1}"  # всегда есть следующий хоп
         return c
 
-    p1, p2, p3, p4, p5, p6, p7 = _patched(wallet_messages=_wallet_messages_response(), crossing=None, evm_pages={})
-    with p1, p2, p3, p4, p5, p6, p7:
+    p1, p2, p3, p4, p5, p6, p7, p8, p9 = _patched(wallet_messages=_wallet_messages_response(), crossing=None, evm_pages={})
+    with p1, p2, p3, p4, p5, p6, p7, p8, p9:
         bt.lz.find_bridge_crossing.side_effect = _cross_side_effect
         result = _run(bt.trace_full_path(TRON_SENDER))
 
@@ -565,12 +579,12 @@ def test_bridge_compose_failed_returns_explicit_status():
     отличаться от RESTED_AT_ADDRESS/RESTED_AT_CONTRACT, а не падать
     необработанным исключением."""
     hub_address = "0xarbitrumhuboapp0000000000000000000000000"
-    p1, p2, p3, p4, p5, p6, p7 = _patched(
+    p1, p2, p3, p4, p5, p6, p7, p8, p9 = _patched(
         wallet_messages=_wallet_messages_response(),
         crossing=_crossing_compose_failed(to_address=hub_address),
         evm_pages={},  # не должен вызываться вовсе — трейс должен остановиться на bridge-хопе
     )
-    with p1, p2, p3, p4, p5, p6, p7:
+    with p1, p2, p3, p4, p5, p6, p7, p8, p9:
         result = _run(bt.trace_full_path(TRON_SENDER))
         bt.get_token_transfers.assert_not_called()
 
@@ -584,8 +598,8 @@ def test_bridge_compose_failed_returns_explicit_status():
 
 
 def test_no_bridge_deposit_found():
-    p1, p2, p3, p4, p5, p6, p7 = _patched(wallet_messages=[], crossing=None, evm_pages={})
-    with p1, p2, p3, p4, p5, p6, p7:
+    p1, p2, p3, p4, p5, p6, p7, p8, p9 = _patched(wallet_messages=[], crossing=None, evm_pages={})
+    with p1, p2, p3, p4, p5, p6, p7, p8, p9:
         result = _run(bt.trace_full_path(TRON_SENDER))
 
     assert result["final_status"] == "NO_BRIDGE_DEPOSIT_FOUND"
@@ -594,12 +608,12 @@ def test_no_bridge_deposit_found():
 
 
 def test_bridge_message_not_found():
-    p1, p2, p3, p4, p5, p6, p7 = _patched(
+    p1, p2, p3, p4, p5, p6, p7, p8, p9 = _patched(
         wallet_messages=_wallet_messages_response(),
         crossing={"found": False, "confidence": "UNRESOLVED", "note": "не найдено"},
         evm_pages={},
     )
-    with p1, p2, p3, p4, p5, p6, p7:
+    with p1, p2, p3, p4, p5, p6, p7, p8, p9:
         result = _run(bt.trace_full_path(TRON_SENDER))
 
     assert result["final_status"] == "BRIDGE_MESSAGE_NOT_FOUND"
@@ -608,12 +622,12 @@ def test_bridge_message_not_found():
 
 
 def test_in_transit_not_delivered():
-    p1, p2, p3, p4, p5, p6, p7 = _patched(
+    p1, p2, p3, p4, p5, p6, p7, p8, p9 = _patched(
         wallet_messages=_wallet_messages_response(),
         crossing=_crossing_inflight(),
         evm_pages={},
     )
-    with p1, p2, p3, p4, p5, p6, p7:
+    with p1, p2, p3, p4, p5, p6, p7, p8, p9:
         result = _run(bt.trace_full_path(TRON_SENDER))
 
     assert result["final_status"] == "IN_TRANSIT"
@@ -625,8 +639,8 @@ def test_non_evm_destination_stops_cleanly():
     solana_crossing = _crossing_delivered(to_address="SoLanaRecipientAddr111111111111111111111")
     solana_crossing["bridge_exit"]["eid"] = 30168  # Solana
     solana_crossing["bridge_exit"]["chain"] = "Solana"
-    p1, p2, p3, p4, p5, p6, p7 = _patched(wallet_messages=_wallet_messages_response(), crossing=solana_crossing, evm_pages={})
-    with p1, p2, p3, p4, p5, p6, p7:
+    p1, p2, p3, p4, p5, p6, p7, p8, p9 = _patched(wallet_messages=_wallet_messages_response(), crossing=solana_crossing, evm_pages={})
+    with p1, p2, p3, p4, p5, p6, p7, p8, p9:
         result = _run(bt.trace_full_path(TRON_SENDER))
 
     assert result["final_status"] == "RESTED_AT_ADDRESS"
@@ -637,12 +651,12 @@ def test_non_evm_destination_stops_cleanly():
 
 def test_start_type_tx_hash_skips_tron_step():
     recipient = BINANCE_ETH
-    p1, p2, p3, p4, p5, p6, p7 = _patched(
+    p1, p2, p3, p4, p5, p6, p7, p8, p9 = _patched(
         wallet_messages=None,  # should never be called
         crossing=_crossing_delivered(to_address=recipient),
         evm_pages={},
     )
-    with p1, p2, p3, p4, p5, p6, p7:
+    with p1, p2, p3, p4, p5, p6, p7, p8, p9:
         result = _run(bt.trace_full_path("0xcae6f9052cc8...", start_type="tx_hash"))
 
     assert result["final_status"] == "RESTED_AT_EXCHANGE"
@@ -807,6 +821,71 @@ def test_walk_evm_rested_at_address_when_pages_genuinely_exhausted():
     print("test_walk_evm_rested_at_address_when_pages_genuinely_exhausted: OK")
 
 
+# --- Тесты observed_name_tags write-through (пункты 5-6 задания) ---
+
+def test_observed_name_write_through_caches_after_first_lookup():
+    """Если TronGrid реально отдаёт account_name (проверено живым запросом
+    в этой сессии — см. observed_name_tags.py) — первый вызов
+    _annotate_tron_observed_name находит имя через TronGrid и пишет его в
+    persistent-кэш; второй вызов для ТОГО ЖЕ адреса берёт запись из кэша,
+    БЕЗ повторного обращения к TronGrid (assert_called_once на мок
+    get_tron_account_info). Кэш временный (отдельный файл), не трогает
+    реальный .observed_name_tags_cache.json репозитория."""
+    import os as _os
+    tmp_cache = _os.path.join(_os.path.dirname(bt.__file__), ".test_observed_name_cache_tmp.json")
+    if _os.path.exists(tmp_cache):
+        _os.remove(tmp_cache)
+
+    # hex("UsdtOFT") — та же кодировка, что реально отдаёт TronGrid (проверено
+    # живым запросом на TFG4wBaDQ8sHWWP1ACeSGnoNR6RRzevLPt в этой сессии).
+    m_account_info = AsyncMock(return_value={"data": [{"account_name": "557364744f4654"}], "success": True})
+
+    try:
+        with patch.object(observed_name_tags, "_CACHE_PATH", tmp_cache), \
+             patch.object(bt, "get_tron_account_info", m_account_info):
+            first = _run(bt._annotate_tron_observed_name("TFG4wBaDQ8sHWWP1ACeSGnoNR6RRzevLPt"))
+            second = _run(bt._annotate_tron_observed_name("TFG4wBaDQ8sHWWP1ACeSGnoNR6RRzevLPt"))
+
+        assert first is not None and first["name"] == "UsdtOFT"
+        assert first["source"] == observed_name_tags.SOURCE_TRONGRID
+        assert second == first
+        m_account_info.assert_called_once()  # второй вызов пришёл из кэша
+    finally:
+        if _os.path.exists(tmp_cache):
+            _os.remove(tmp_cache)
+    print("test_observed_name_write_through_caches_after_first_lookup: OK")
+
+
+def test_observed_name_does_not_affect_final_status():
+    """Обнаруженное самоуказанное имя — ИНФОРМАЦИОННОЕ, не должно влиять на
+    final_status/маршрут (сознательное решение, см. observed_name_tags.py):
+    RESTED_AT_ADDRESS остаётся RESTED_AT_ADDRESS, просто с добавленными
+    observed_name/observed_name_source в результате."""
+    import os as _os
+    tmp_cache = _os.path.join(_os.path.dirname(bt.__file__), ".test_observed_name_cache_tmp2.json")
+    if _os.path.exists(tmp_cache):
+        _os.remove(tmp_cache)
+
+    recipient = "0x7777777777777777777777777777777777777f"
+    p1, p2, p3, p4, p5, p6, p7, p8, p9 = _patched(
+        wallet_messages=_wallet_messages_response(),
+        crossing=_crossing_delivered(to_address=recipient),
+        evm_pages={},  # тупик -> RESTED_AT_ADDRESS
+        evm_address_info={"name": "SomeSelfDeclaredName", "public_tags": []},
+    )
+    try:
+        with p1, p2, p3, p4, p5, p6, p7, p8, p9, patch.object(observed_name_tags, "_CACHE_PATH", tmp_cache):
+            result = _run(bt.trace_full_path(TRON_SENDER))
+    finally:
+        if _os.path.exists(tmp_cache):
+            _os.remove(tmp_cache)
+
+    assert result["final_status"] == "RESTED_AT_ADDRESS"  # НЕ изменился
+    assert result["observed_name"] == "SomeSelfDeclaredName"
+    assert result["observed_name_source"] == "blockscout_name_tag"
+    print("test_observed_name_does_not_affect_final_status: OK")
+
+
 if __name__ == "__main__":
     test_full_path_rests_at_exchange()
     test_full_path_rests_at_dex_contract()
@@ -833,4 +912,6 @@ if __name__ == "__main__":
     test_walk_evm_finds_match_on_later_page_stops_pagination()
     test_walk_evm_search_depth_exceeded_when_no_match_within_page_cap()
     test_walk_evm_rested_at_address_when_pages_genuinely_exhausted()
+    test_observed_name_write_through_caches_after_first_lookup()
+    test_observed_name_does_not_affect_final_status()
     print("\nВСЕ ОФЛАЙН-ТЕСТЫ bridge_tracer.py ПРОЙДЕНЫ")
