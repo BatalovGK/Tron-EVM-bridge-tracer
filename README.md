@@ -58,7 +58,7 @@ python3 layerzero_tracer.py --tx <хэш транзакции LayerZero>
 pytest -v --ignore=aml/common/tests --ignore=aml/attribution/tests/test_service.py
 ```
 
-109 тестов должны пройти. Два указанных исключения — тесты `aml/common/`
+110 тестов должны пройти. Два указанных исключения — тесты `aml/common/`
 и `attribution/test_service.py` — идут против настоящего PostgreSQL
 (`POSTGRES_DSN`), к трейсеру не относятся и в этом задании не поднимаются;
 остальные тесты выполняются полностью офлайн (все внешние API замоканы на
@@ -95,7 +95,7 @@ usdt0_deployments.py       — живой (с диск-кэшем на 24ч) к�
                               официальному USDT0 Deployments API
 known_contracts.py         — статический реестр меток (биржи/DEX/мосты)
                               для стоп-условий пост-bridge обхода
-test_bridge_tracer.py      — офлайн-тесты trace_full_path() (20 сценариев)
+test_bridge_tracer.py      — офлайн-тесты trace_full_path() (21 сценарий)
 test_layerzero_tracer.py   — офлайн-тесты find_bridge_crossing()
 aml/                       — переиспользуемая часть основной AML-платформы
   evm_adapter/                клиент к Blockscout Pro (rate limiting, кэш)

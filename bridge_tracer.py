@@ -194,6 +194,7 @@ async def trace_full_path(
         if not crossing["found"]:
             return _flat_result(final_status="BRIDGE_MESSAGE_NOT_FOUND", hops=hops, note=crossing["note"])
 
+        compose_status = crossing["bridge_exit"].get("compose_status")
         hops.append({
             "segment": "bridge",
             "leg": leg,
@@ -207,6 +208,14 @@ async def trace_full_path(
             "guid": crossing["guid"],
             "confidence": crossing["confidence"],
             "status": crossing["message_status"],
+            # "N/A" (или отсутствует) — Legacy Mesh Hop 2 не настроен для этого
+            # сообщения вовсе; "SUCCEEDED" — Hop 2 исполнился (см. compose_tx_hash
+            # ниже); любое другое значение (например, "SIMULATION_REVERTED") —
+            # Hop 2 был ЗАПУЩЕН, но НЕ исполнился успешно (см. BRIDGE_COMPOSE_FAILED
+            # ниже) — оставляем это поле в каждом bridge-хопе явно, а не только
+            # внутри логики ветвления, чтобы оно было видно в hops[] независимо
+            # от исхода.
+            "compose_status": compose_status,
         })
 
         if crossing["bridge_exit"]["tx_hash"] is None:
@@ -220,7 +229,35 @@ async def trace_full_path(
 
         compose_tx_hash = crossing["bridge_exit"].get("compose_tx_hash")
         if not compose_tx_hash:
-            break  # финальный хоп: обычное сообщение, либо Legacy Mesh Hop 2 уже пройден
+            if compose_status and compose_status != "N/A":
+                # Compose был ЗАПУЩЕН (compose_status присутствует и не "N/A"),
+                # но НЕ дал compose_tx_hash — то есть Hop 2 не исполнился успешно
+                # (например, "SIMULATION_REVERTED": исполнитель не смог вызвать
+                # Composer-контракт на хабе). Обнаружено живым запуском на
+                # реальном примере: без этой проверки трейсер молча продолжал
+                # как будто хаб — обычная финальная точка выхода из моста,
+                # теряя сигнал "средства могли застрять на хабе" — важный для
+                # комплаенс-офицера случай, не то же самое, что "Hop 2 не
+                # настроен для этого сообщения вовсе" (compose_status == "N/A").
+                return _flat_result(
+                    final_status="BRIDGE_COMPOSE_FAILED",
+                    hops=hops,
+                    final_chain=crossing["bridge_exit"]["chain"],
+                    final_address=crossing["bridge_exit"]["to_address"],
+                    final_tx_hash=crossing["bridge_exit"]["tx_hash"],
+                    note=(
+                        f"Legacy Mesh Hop 2 (compose) был запущен на "
+                        f"{crossing['bridge_exit']['chain']}, но НЕ исполнился "
+                        f"успешно (compose_status={compose_status!r}) — средства "
+                        "пришли на хаб (Hop 1 доставлен), но автоматический "
+                        "перевод дальше НЕ состоялся. Возможно, требуется ручное "
+                        "вмешательство/повторная попытка на стороне моста — вне "
+                        "scope этого трейсера. Трейс корректно остановлен на "
+                        "точке выхода из Hop 1, а не молча продолжен как будто "
+                        "это обычная финальная точка."
+                    ),
+                )
+            break  # финальный хоп: Hop 2 не настроен для этого сообщения вовсе
         current_bridge_tx_hash = compose_tx_hash
 
     dest_chain_name = crossing["bridge_exit"]["chain"]

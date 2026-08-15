@@ -72,6 +72,19 @@ def _crossing_inflight():
     return d
 
 
+def _crossing_compose_failed(to_address="0x000000000000000000000000000000000000aa"):
+    """Legacy Mesh Hop 1 доставлен на хаб, но compose (Hop 2) НЕ исполнился
+    успешно — реальный случай, найденный живым запуском (tx
+    0x8f1497875d07…3f77f0, compose_status=SIMULATION_REVERTED). Отличие от
+    _crossing_delivered(): compose_status присутствует и НЕ "N/A", но
+    compose_tx_hash всё равно None (в отличие от обычного "нет Hop 2 вовсе",
+    где compose_status == "N/A")."""
+    d = _crossing_delivered(to_address=to_address)
+    d["bridge_exit"]["compose_status"] = "SIMULATION_REVERTED"
+    d["bridge_exit"]["compose_tx_hash"] = None
+    return d
+
+
 def _evm_transfer_item(from_addr, to_addr, tx_hash="0xhop1"):
     return {
         "from": {"hash": from_addr}, "to": {"hash": to_addr},
@@ -520,6 +533,35 @@ def test_bridge_hop_chase_capped_at_max_bridge_hops():
     print("test_bridge_hop_chase_capped_at_max_bridge_hops: OK")
 
 
+def test_bridge_compose_failed_returns_explicit_status():
+    """Реальный случай, найденный живым запуском (tx 0x8f1497875d07…3f77f0):
+    Legacy Mesh Hop 1 доставлен на хаб, но compose (Hop 2) провалился
+    (compose_status=SIMULATION_REVERTED, compose_tx_hash отсутствует). Без
+    явной обработки трейсер молча продолжал бы как будто хаб — обычная
+    финальная точка выхода из моста (та же ветка кода, что и "Hop 2 не
+    настроен вовсе"), теряя сигнал "средства могли застрять на хабе, Hop 2 не
+    состоялся" — важный для комплаенс-офицера случай. final_status должен
+    отличаться от RESTED_AT_ADDRESS/RESTED_AT_CONTRACT, а не падать
+    необработанным исключением."""
+    hub_address = "0xarbitrumhuboapp0000000000000000000000000"
+    p1, p2, p3, p4, p5, p6 = _patched(
+        wallet_messages=_wallet_messages_response(),
+        crossing=_crossing_compose_failed(to_address=hub_address),
+        evm_pages={},  # не должен вызываться вовсе — трейс должен остановиться на bridge-хопе
+    )
+    with p1, p2, p3, p4, p5, p6:
+        result = _run(bt.trace_full_path(TRON_SENDER))
+        bt.get_token_transfers.assert_not_called()
+
+    assert result["final_status"] == "BRIDGE_COMPOSE_FAILED"
+    assert result["final_address"] == hub_address
+    bridge_hops = [h for h in result["hops"] if h["segment"] == "bridge"]
+    assert len(bridge_hops) == 1
+    assert bridge_hops[0]["compose_status"] == "SIMULATION_REVERTED"
+    assert "SIMULATION_REVERTED" in result["note"]
+    print("test_bridge_compose_failed_returns_explicit_status: OK")
+
+
 def test_no_bridge_deposit_found():
     p1, p2, p3, p4, p5, p6 = _patched(wallet_messages=[], crossing=None, evm_pages={})
     with p1, p2, p3, p4, p5, p6:
@@ -604,6 +646,7 @@ if __name__ == "__main__":
     test_incoming_message_to_tron_not_mistaken_for_deposit()
     test_full_path_chases_legacy_mesh_hop2()
     test_bridge_hop_chase_capped_at_max_bridge_hops()
+    test_bridge_compose_failed_returns_explicit_status()
     test_no_bridge_deposit_found()
     test_bridge_message_not_found()
     test_in_transit_not_delivered()
