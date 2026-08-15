@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """
 bridge_tracer.py — Layer 1: сквозной трейсер полного пути транзакции через
-мост LayerZero. Склеивает два сетевых адаптера и LayerZero Scan API в один
-самодостаточный async-модуль:
+мост LayerZero. Склеивает три сетевых адаптера, Bridge Contract Registry и
+LayerZero Scan API в один самодостаточный async-модуль:
 
-    LayerZero Scan (layerzero_tracer.py, messages/wallet — поиск депозита
-        на Tron) -> LayerZero Scan (find_bridge_crossing — сопоставление
+    TronGrid (bridge_registry.py, известные bridge-адреса Tron — поиск
+        депозита, ОСНОВНОЙ путь), fallback на LayerZero Scan
+        (layerzero_tracer.py, messages/wallet, если TronGrid ничего не
+        нашёл) -> LayerZero Scan (find_bridge_crossing — сопоставление
         входа/выхода моста) -> Blockscout Pro (aml/evm_adapter, любая
         EVM-сеть, куда пришёл мост)
 
-Шаг 1 больше не использует tron_adapter как сетевой клиент (см. историю
-исправления в _find_tron_bridge_deposit ниже) — от него нужна только
-чистая утилита base58_to_hex, сети не требующая.
+Шаг 1 — двухуровневая детекция (см. _find_tron_bridge_deposit ниже и
+историю решения в bridge_registry.py): TronGrid как основной, более быстрый
+путь (сверка исходящих TRC-20-переводов с генерик-реестром известных
+bridge-адресов), LayerZero Scan messages/wallet как fallback для депозитов
+через ещё не размеченный в реестре промежуточный контракт.
 
 Единая входная точка — trace_full_path(). Модуль не знает, кто его вызывает
 (CLI ниже — просто одна из обёрток, наравне с будущими agent/tools_bridge.py
@@ -35,12 +39,17 @@ Postgres + TheGraph там, где задача явно просит "MVP, бе
 
 ОГРАНИЧЕНИЯ ЭТОГО MVP (осознанно, см. definition of done в брифинге)
 -----------------------------------------------------------------------
-- Шаг 1 (поиск депозита через LayerZero Scan messages/wallet) распознаёт
-  депозит в мост только по реестру Tron-OApp из официального USDT0
-  Deployments API (usdt0_deployments.get_tron_oft_contracts(), фильтр по
-  pathway.sender.address) — сейчас там один адрес (USDT0 OFT на Tron).
-  Сообщения через другие OApp/протоколы с того же адреса пропускаются как
-  вне scope MVP.
+- Шаг 1 (TronGrid, основной путь) распознаёт депозит только по адресам,
+  ПОПАВШИМ в bridge_registry.get_registry_for_tron() — официальный OFT из
+  USDT0 Deployments API плюс небольшой эмпирический список вручную
+  подтверждённых pool/router-контрактов (сейчас один). Перевод через
+  ЛЮБОЙ другой, ещё не размеченный там контракт TronGrid-путь не найдёт —
+  для него подхватывает fallback на LayerZero Scan messages/wallet, который
+  не ограничен реестром (спрашивает у LayerZero Scan напрямую, какие
+  сообщения адрес реально отправил), но при этом сам ограничен реестром
+  известных Tron-OApp из того же usdt0_deployments.py (фильтр по
+  pathway.sender.address — сейчас там один адрес, USDT0 OFT на Tron).
+  Сообщения через другие OApp/протоколы пропускаются как вне scope MVP.
 - Шаг 3 (evm_adapter) — линейный обход "один хоп = один самый ранний
   подходящий исходящий ERC-20-перевод", НЕ amount-aware taint-трейсинг
   (это другая, более объёмная задача — см. hop_tracer.py выше). Схема
@@ -88,8 +97,9 @@ if _AML_DIR not in sys.path:
     sys.path.insert(0, _AML_DIR)
 
 import layerzero_tracer as lz  # noqa: E402
+import bridge_registry  # noqa: E402
 from known_contracts import lookup_contract  # noqa: E402
-from tron_adapter import base58_to_hex  # noqa: E402
+from tron_adapter import base58_to_hex, get_trc20_transfers, close_client as _close_tron_client  # noqa: E402
 from evm_adapter import get_token_transfers, close_client as _close_evm_client  # noqa: E402
 from usdt0_deployments import get_tron_oft_contracts  # noqa: E402
 
@@ -103,11 +113,12 @@ MAX_BRIDGE_HOPS = 3
 
 
 async def close_clients() -> None:
-    """Закрывает aiohttp-сессию evm_adapter. Вызывать один раз по завершении
-    работы с trace_full_path (см. main() ниже). tron_adapter здесь больше не
-    используется как сетевой клиент (see _find_tron_bridge_deposit) — только
-    его чистая утилита base58_to_hex, сети не требующая."""
+    """Закрывает aiohttp-сессии evm_adapter И tron_adapter. Вызывать один раз
+    по завершении работы с trace_full_path (см. main() ниже). tron_adapter
+    теперь снова используется как сетевой клиент — TronGrid-путь детекции
+    депозита, см. _find_tron_bridge_deposit_via_trongrid ниже."""
     await _close_evm_client()
+    await _close_tron_client()
 
 
 async def trace_full_path(
@@ -258,36 +269,145 @@ async def trace_full_path(
 async def _find_tron_bridge_deposit(tron_address: str) -> Optional[dict[str, Any]]:
     """
     Находит депозит в мост LayerZero, отправленный с данного Tron-адреса —
-    через LayerZero Scan (messages/wallet), а НЕ через угадывание по TronGrid.
+    двухуровневая детекция:
+      1. TronGrid + Bridge Contract Registry (ОСНОВНОЙ путь, один запрос к
+         TronGrid) — см. _find_tron_bridge_deposit_via_trongrid.
+      2. LayerZero Scan messages/wallet (FALLBACK — если TronGrid ничего не
+         нашёл в реестре или недоступен) — см.
+         _find_tron_bridge_deposit_via_layerzero_scan.
 
-    ПОЧЕМУ НЕ TronGrid (история, обнаружено живым запуском)
+    ИСТОРИЯ РЕШЕНИЯ (два разворота за одну сессию, оба — по живым данным,
+    ни один не по памяти/предположению)
+    -----------------------------------------------------------------------
+    Первая версия использовала ТОЛЬКО TronGrid: эвристика "прямой transfer
+    на единственный известный OFT-адрес". Живой запуск нашёл ложноотрицательный
+    случай — депозит шёл через промежуточный router-контракт, прямого
+    Transfer на OFT просто не было, хотя сообщение LayerZero было реально
+    отправлено и доставлено. Заменена на LayerZero Scan messages/wallet как
+    ЕДИНСТВЕННЫЙ механизм (см. историю в
+    _find_tron_bridge_deposit_via_layerzero_scan ниже).
+
+    Позже пользователь вручную нашёл на Tronscan именно такой router-
+    контракт и подтвердил двумя транзакциями, что средства через него в той
+    же атомарной tx доходят до официального OFT (см.
+    bridge_registry.EMPIRICAL_VERIFIED_ENTRIES). Вместо возврата к старой
+    "угадывающей" эвристике TronGrid-путь теперь сверяется с РАСШИРЯЕМЫМ
+    Bridge Contract Registry (bridge_registry.py — официальные адреса из
+    USDT0 Deployments API + эмпирически подтверждённые вручную), а не с
+    одним жёстко заданным адресом — это не тот же баг под новым названием:
+    реестр можно пополнять по мере обнаружения новых router-контрактов, не
+    трогая логику детекции. LayerZero Scan остаётся полноценным fallback'ом
+    для всего, что в реестр ещё не попало — а не отбрасывается.
+    """
+    primary = await _find_tron_bridge_deposit_via_trongrid(tron_address)
+    if primary is not None:
+        return primary
+    return await _find_tron_bridge_deposit_via_layerzero_scan(tron_address)
+
+
+async def _find_tron_bridge_deposit_via_trongrid(tron_address: str) -> Optional[dict[str, Any]]:
+    """
+    TronGrid-путь (ОСНОВНОЙ, см. историю решения в _find_tron_bridge_deposit
+    и провенанс адресов в bridge_registry.py): проверяет исходящие TRC-20
+    Transfer-события адреса на прямое совпадение получателя ("to") с
+    известным bridge-адресом Tron из bridge_registry.get_registry_for_tron()
+    — официальные OFT-контракты (USDT0 Deployments API) И эмпирически
+    подтверждённые pool/router-контракты.
+
+    Один запрос к TronGrid вместо двух последовательных к разным API
+    (быстрее fallback-пути), но принципиально ограничен известным реестром:
+    перевод через ЕЩЁ не размеченный там контракт здесь не найдётся — для
+    него подхватывает _find_tron_bridge_deposit_via_layerzero_scan.
+
+    Не фильтрует по конкретному TRC-20 token contract_address (например,
+    USDT), потому что bridge_registry.py принципиально не привязан к одному
+    токену (USDT0 — не единственный протокол, который он может описывать в
+    будущем) — сверяет ПОЛУЧАТЕЛЯ каждого исходящего Transfer-события с
+    реестром, не тип токена.
+
+    Известное ограничение (тот же класс, что и MAX_EVM_TRANSFERS_PER_PAGE в
+    _walk_evm): читается только первая страница TronGrid (limit=200,
+    сортировка не гарантирована документацией, но по наблюдению — свежие
+    первыми); при очень высокой активности адреса релевантный перевод может
+    не попасть на страницу — тогда TronGrid-путь молча вернёт None, и
+    сработает fallback на LayerZero Scan (не БАГ, а РАЗУМНАЯ деградация -
+    результат в итоге всё равно найдётся, просто медленнее).
+    """
+    registry_entries: Any
+    transfers: Any
+    registry_entries, transfers = await asyncio.gather(
+        asyncio.to_thread(bridge_registry.get_registry_for_tron),
+        get_trc20_transfers(address=tron_address, only_from=True),
+        return_exceptions=True,
+    )
+    if isinstance(registry_entries, BaseException) or isinstance(transfers, BaseException):
+        return None  # TronGrid или USDT0 Deployments API недоступны — fallback разберётся
+
+    registry_by_address = {entry["address"]: entry for entry in registry_entries}
+    if not registry_by_address:
+        return None
+
+    for item in transfers.get("data", []):
+        if item.get("type") != "Transfer":
+            continue  # TronGrid отдаёт Transfer и Approval в одном списке
+        entry = registry_by_address.get(item.get("to"))
+        if entry is None:
+            continue
+        raw_tx_hash = item.get("transaction_id")
+        if not raw_tx_hash:
+            continue
+        # TronGrid отдаёт transaction_id БЕЗ префикса "0x" (голый hex) — а
+        # LayerZero Scan API (fetch_message -> /v1/messages/tx/{txHash})
+        # требует префикс "0x" (без него отдаёт "не найдено" даже на
+        # существующем сообщении, подтверждено живым запросом в этой
+        # сессии на реальной tx 800fd19a...). LayerZero Scan сам всегда
+        # возвращает txHash С префиксом (см. find_messages_by_wallet) —
+        # нормализуем на границе между двумя API, а не полагаемся на то,
+        # что оба формата совпадут случайно.
+        tx_hash = raw_tx_hash if raw_tx_hash.startswith("0x") else "0x" + raw_tx_hash
+
+        block_ts = item.get("block_timestamp")  # TronGrid отдаёт unix ms
+        return {
+            "tx_hash": tx_hash,
+            "hop": {
+                "segment": "tron_deposit",
+                "chain": "Tron",
+                "from_address": item.get("from"),
+                "oapp": entry["contract_role"],
+                "tx_hash": tx_hash,
+                "timestamp": block_ts // 1000 if isinstance(block_ts, int) else None,
+                "detection_method": "trongrid_registry_match",
+                "registry_entry_type": entry["type"],
+                "registry_source": entry["source"],
+            },
+        }
+    return None
+
+
+async def _find_tron_bridge_deposit_via_layerzero_scan(tron_address: str) -> Optional[dict[str, Any]]:
+    """
+    LayerZero Scan-путь (FALLBACK — вызывается только если
+    _find_tron_bridge_deposit_via_trongrid ничего не нашёл в реестре или
+    TronGrid/USDT0 Deployments API были недоступны).
+
+    ПОЧЕМУ ЭТОТ ПУТЬ ВООБЩЕ НУЖЕН (история, обнаружено живым запуском)
     -----------------------------------------------------------
-    Первая версия искала среди исходящих TRC-20 Transfer-событий адреса
-    (через tron_adapter.get_trc20_transfers) перевод, идущий НАПРЯМУЮ на
-    известный bridge-контракт (TRON_BRIDGE_DEPOSIT_CONTRACTS). На реальном
-    адресе, взятом прямо со страницы LayerZero Scan для подтверждённого
-    DELIVERED-сообщения Tron -> Arbitrum, это дало ложноотрицательный
-    NO_BRIDGE_DEPOSIT_FOUND: пользователь перевёл USDT не напрямую на OFT-
-    контракт, а через промежуточный router-контракт (подтверждено разбором
-    сырых event-логов транзакции через TronGrid gettransactioninfobyid) —
-    прямого Transfer от пользователя на известный контракт просто не
-    существовало, хотя сообщение LayerZero было реально отправлено и
-    доставлено. Эвристика "прямой перевод на известный контракт" в принципе
-    не может покрыть произвольную глубину промежуточных router/aggregator-
-    контрактов без отдельного рекурсивного разбора внутренних переводов
-    каждой транзакции — что не входит в scope MVP.
-
-    Вместо этого используем layerzero_tracer.find_messages_by_wallet() —
-    LayerZero Scan уже знает итоговый tx хэш и настоящего отправителя
-    (source.tx.from, то же поле, что find_bridge_crossing() предпочитает
-    pathway.sender.address — см. его докстринг) независимо от того, сколько
-    контрактов было между пользователем и OFT.
+    TronGrid-путь ограничен ИЗВЕСТНЫМ реестром bridge-адресов — перевод
+    через ещё не размеченный там промежуточный router/aggregator-контракт
+    он не найдёт в принципе, сколько бы записей в реестр ни добавили (это
+    было исходной причиной ложноотрицательного результата, из-за которой
+    этот путь и появился — см. историю в _find_tron_bridge_deposit).
+    layerzero_tracer.find_messages_by_wallet() устраняет саму необходимость
+    угадывать промежуточные контракты: LayerZero Scan уже знает итоговый tx
+    хэш и настоящего отправителя (source.tx.from, то же поле, что
+    find_bridge_crossing() предпочитает pathway.sender.address — см. его
+    докстринг) независимо от того, сколько контрактов было между
+    пользователем и OFT.
 
     Реестр известных Tron-OApp (фильтр "это сообщение через USDT0, а не
-    какой-то другой протокол вне scope MVP") — больше не захардкожен, а
-    берётся живым запросом (с диск-кэшем) к официальному USDT0 Deployments
-    API через usdt0_deployments.get_tron_oft_contracts() — см. этот модуль,
-    почему.
+    какой-то другой протокол вне scope MVP") — живым запросом (с диск-
+    кэшем) к официальному USDT0 Deployments API через
+    usdt0_deployments.get_tron_oft_contracts() — см. этот модуль, почему.
     """
     hex_addr = "0x" + base58_to_hex(tron_address)
     messages, tron_contracts = await asyncio.gather(
@@ -320,6 +440,7 @@ async def _find_tron_bridge_deposit(tron_address: str) -> Optional[dict[str, Any
                 "oapp": oapp_name,
                 "tx_hash": tx_hash,
                 "timestamp": source_tx.get("blockTimestamp"),
+                "detection_method": "layerzero_scan_wallet_fallback",
             },
         }
     return None

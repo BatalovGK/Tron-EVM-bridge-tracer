@@ -40,8 +40,10 @@ Verifier Network), а не эвристикой — поэтому confidence = 
   на которых построен USDT0). Wormhole, liquidity-pool мосты (Symbiosis,
   Allbridge, Meson) и intent-based мосты (ERC-7683) не покрыты — расписаны
   отдельно в архитектурном документе, но не реализованы в этом MVP.
-- Один хоп за вызов (source -> destination). Многоходовые цепочки не
-  реализованы, но структура find_bridge_crossing() к этому готова.
+- find_bridge_crossing() сама по себе сопоставляет один хоп за вызов
+  (source -> destination) и не рекурсирует. Многоходовые цепочки (Legacy
+  Mesh) собираются ВЫЗЫВАЮЩИМ кодом через повторный вызов на compose_tx_hash
+  — см. docstring самой функции и bridge_tracer.trace_full_path().
 - Endpoint ID (eid) — это внутренняя нумерация LayerZero, НЕ равна ни chain ID
   сети (EIP-155 для EVM), ни chain ID других протоколов вроде Wormhole.
   Реестр LAYERZERO_EID_INFO ниже — полный список mainnet V2 сетей LayerZero
