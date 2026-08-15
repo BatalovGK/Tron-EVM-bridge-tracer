@@ -4,16 +4,19 @@
 https://docs.layerzero.network/v2/tools/api/scan/testnet), чтобы проверить
 логику парсинга без доступа к сети (в этой песочнице сеть отключена).
 """
+import json
 from unittest.mock import patch, MagicMock
 import layerzero_tracer as lz
 
 
-def _build_oft_payload(recipient_hex: str, amount_sd: int) -> str:
+def _build_oft_payload(recipient_hex: str, amount_sd: int, msg_type: bytes = b"\x00\x02") -> str:
     """Строит синтетический OFT-payload в реальном формате (см.
     layerzero_tracer._decode_oft_recipient): 2 байта типа + 32-байтный
-    padded-адрес + 8-байтный amountSD."""
+    padded-адрес + 8-байтный amountSD. msg_type по умолчанию 0x0002 (SEND,
+    обычное сообщение) — передайте b"\\x00\\x04" (SEND_AND_CALL, составное
+    сообщение Legacy Mesh) для теста msg-type guard'а декодера."""
     addr_bytes = bytes.fromhex(recipient_hex.removeprefix("0x"))
-    payload = b"\x00\x02" + (b"\x00" * 12 + addr_bytes) + amount_sd.to_bytes(8, "big")
+    payload = msg_type + (b"\x00" * 12 + addr_bytes) + amount_sd.to_bytes(8, "big")
     return "0x" + payload.hex()
 
 
@@ -50,6 +53,7 @@ FAKE_MESSAGE_DELIVERED = {
             },
             "destination": {
                 "status": "SUCCEEDED",
+                "lzCompose": {"status": "N/A"},  # обычное сообщение, без Legacy Mesh hop2
                 "tx": {
                     "txHash": "0xdeadbeefdeadbeef_eth_dest_tx",
                     "blockNumber": 21000000,
@@ -65,6 +69,23 @@ FAKE_MESSAGE_DELIVERED = {
         }
     ]
 }
+
+# Тот же перевод, но с автоматически исполнившимся Legacy Mesh compose-вызовом
+# на destination-сети — сигнал, что это Hop 1 из 2 (см. живую находку в
+# докстринге find_bridge_crossing()).
+FAKE_MESSAGE_WITH_HOP2 = json.loads(json.dumps(FAKE_MESSAGE_DELIVERED))
+FAKE_MESSAGE_WITH_HOP2["data"][0]["destination"]["lzCompose"] = {
+    "status": "SUCCEEDED",
+    "txs": [{"txHash": "0xcompose_hop2_tx"}],
+}
+
+# Составное (SEND_AND_CALL, тип 0x0004) сообщение — payload длиннее не делаем
+# (тест специально проверяет msg-type guard при СОВПАДАЮЩЕЙ длине 42 байта),
+# так что декодер должен отклонить его по типу, а не по длине.
+FAKE_MESSAGE_COMPOSED_WRONG_TYPE = json.loads(json.dumps(FAKE_MESSAGE_DELIVERED))
+FAKE_MESSAGE_COMPOSED_WRONG_TYPE["data"][0]["source"]["tx"]["payload"] = _build_oft_payload(
+    OFT_REAL_RECIPIENT, OFT_AMOUNT_SD, msg_type=b"\x00\x04"
+)
 
 FAKE_MESSAGE_INFLIGHT = {
     "data": [
@@ -133,6 +154,47 @@ def test_oft_payload_decoding_prefers_real_recipient():
     print("\ntest_oft_payload_decoding_prefers_real_recipient: OK")
 
 
+def test_no_compose_reports_na():
+    with patch("requests.get", new=_mock_get(FAKE_MESSAGE_DELIVERED)):
+        result = lz.find_bridge_crossing("tron_source_tx_hash")
+    exit_ = result["bridge_exit"]
+    assert exit_["compose_status"] == "N/A"
+    assert exit_["compose_tx_hash"] is None
+    print("\ntest_no_compose_reports_na: OK")
+
+
+def test_legacy_mesh_hop2_compose_surfaced():
+    """Реальный случай (Legacy Mesh / USDT0 Transfer Hub): когда LayerZero
+    Scan показывает destination.lzCompose.status != "N/A" с непустым txs,
+    find_bridge_crossing() должен вернуть compose_tx_hash — сигнал
+    вызывающему коду (bridge_tracer.py) продолжить трейс дальше от хаба, а
+    не считать эту bridge_exit финальной. Подтверждено живыми запросами
+    именно на переводах С TRON (не только гипотетически) — см. докстринг
+    find_bridge_crossing() в layerzero_tracer.py, реальные примеры Tron ->
+    Arbitrum -> xlayer/Polygon с завершённым compose."""
+    with patch("requests.get", new=_mock_get(FAKE_MESSAGE_WITH_HOP2)):
+        result = lz.find_bridge_crossing("tron_source_tx_hash")
+    exit_ = result["bridge_exit"]
+    assert exit_["compose_status"] == "SUCCEEDED"
+    assert exit_["compose_tx_hash"] == "0xcompose_hop2_tx"
+    print("\ntest_legacy_mesh_hop2_compose_surfaced: OK")
+
+
+def test_composed_message_payload_not_misdecoded():
+    """Составное (SEND_AND_CALL, тип 0x0004) сообщение не должно декодироваться
+    так, будто это обычный SEND (0x0002) — даже если длина payload случайно
+    совпадает (42 байта). Реальный composed-payload кодирует адрес Composer-
+    контракта в тех же первых 32 байтах, что и настоящего получателя в
+    обычном payload — декодировать его как получателя было бы неверным.
+    Должен сработать безопасный fallback на pathway.receiver.address."""
+    with patch("requests.get", new=_mock_get(FAKE_MESSAGE_COMPOSED_WRONG_TYPE)):
+        result = lz.find_bridge_crossing("tron_source_tx_hash")
+    exit_ = result["bridge_exit"]
+    assert exit_["recipient_source"] == "pathway_receiver_fallback"
+    assert exit_["to_address"] != OFT_REAL_RECIPIENT  # не спутали composed с обычным SEND
+    print("\ntest_composed_message_payload_not_misdecoded: OK")
+
+
 def test_inflight_case():
     with patch("requests.get", new=_mock_get(FAKE_MESSAGE_INFLIGHT)):
         result = lz.find_bridge_crossing("tron_source_tx_inflight")
@@ -176,6 +238,9 @@ def test_404_case():
 if __name__ == "__main__":
     test_delivered_case()
     test_oft_payload_decoding_prefers_real_recipient()
+    test_no_compose_reports_na()
+    test_legacy_mesh_hop2_compose_surfaced()
+    test_composed_message_payload_not_misdecoded()
     test_inflight_case()
     test_missing_payload_falls_back_to_oapp_address()
     test_not_found_case()

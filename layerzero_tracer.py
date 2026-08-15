@@ -388,12 +388,27 @@ def _decode_oft_recipient(payload_hex: Optional[str]) -> Optional[dict[str, Any]
     codec) — поэтому декодирование обёрнуто в try/except и при несовпадении
     длины payload корректно возвращает None (см. вызывающий код: тогда
     используется pathway.receiver.address как менее точный fallback).
+
+    ТИП СООБЩЕНИЯ (первые 2 байта) — обычный send vs composed
+    ---------------------------------------------------------------
+    Живой запрос в этой сессии нашёл реальный "composed" OFT-перевод (Legacy
+    Mesh, USDT0 Transfer Hub): тип 0x0004 (SEND_AND_CALL), payload заметно
+    длиннее 42 байт, а первые 32 байта "получателя" там оказались адресом
+    Composer-контракта на destination-сети, а не реальным получателем —
+    настоящий финальный получатель зашит глубже, в отдельном compose-блоке,
+    формат которого здесь НЕ разбирается (вместо этого Legacy Mesh-переводы
+    дочитываются через отдельное сообщение — см. "compose_tx_hash" в
+    find_bridge_crossing() и докстринг bridge_tracer.py про Legacy Mesh).
+    Обычный (не составной) OFT-перевод — тип 0x0002 (SEND), ровно 42 байта.
+    Проверяем оба условия (тип И длина), а не только длину, — иначе при
+    случайном совпадении длины на другом типе сообщения можно вернуть
+    правдоподобно выглядящий, но неверный адрес.
     """
     if not payload_hex:
         return None
     try:
         raw = bytes.fromhex(payload_hex.removeprefix("0x"))
-        if len(raw) != 42:  # 2 (msg type) + 32 (padded recipient) + 8 (amountSD)
+        if len(raw) != 42 or raw[:2] != b"\x00\x02":  # SEND (0x0002), не SEND_AND_CALL (0x0004)
             return None
         recipient = "0x" + raw[2:34][-20:].hex()
         amount_sd = int.from_bytes(raw[34:42], "big")
@@ -402,14 +417,91 @@ def _decode_oft_recipient(payload_hex: Optional[str]) -> Optional[dict[str, Any]
         return None
 
 
+def find_messages_by_wallet(address_hex: str, testnet: bool = False, timeout: int = 15) -> list[dict[str, Any]]:
+    """
+    Запрашивает LayerZero Scan /v1/messages/wallet/{srcAddress} — список
+    сообщений, где данный адрес выступает source.tx.from (реальным
+    отправителем на исходной сети — это то же самое поле, которое
+    find_bridge_crossing() уже предпочитает pathway.sender.address, см. его
+    докстринг). Возвращает по убыванию времени (свежие первыми) — проверено
+    живым запросом.
+
+    ЗАЧЕМ ЭТО НУЖНО (обнаружено живым запуском в этой сессии)
+    ------------------------------------------------------------
+    Первая версия bridge_tracer.py искала депозит в мост эвристически: через
+    TronGrid — среди исходящих TRC-20 Transfer-событий адреса, ищущих ПРЯМОЙ
+    перевод на известный bridge-контракт. На реальных данных это дало
+    ложноотрицательный результат: пользователь перевёл USDT не напрямую на
+    OFT-контракт, а через промежуточный router-контракт (тот сначала получил
+    USDT, затем сам перевёл их на OFT) — прямого Transfer от пользователя на
+    известный контракт просто не существовало, хотя сообщение LayerZero было
+    реально отправлено и доставлено. Этот эндпоинт устраняет саму
+    необходимость угадывать промежуточные контракты: LayerZero Scan уже знает
+    итоговый tx хэш независимо от того, сколько контрактов было между
+    пользователем и OFT.
+
+    Args:
+        address_hex: адрес в hex-формате (для Tron — "голый" 20-байтный hex
+            с префиксом "0x", БЕЗ версионного байта 0x41 — см. address.py в
+            tron_adapter, normalize_tron_address/base58_to_hex).
+    """
+    base = LAYERZERO_TESTNET if testnet else LAYERZERO_MAINNET
+    url = f"{base}/messages/wallet/{address_hex}"
+    try:
+        resp = requests.get(url, timeout=timeout, headers={"accept": "application/json"})
+    except requests.exceptions.RequestException as e:
+        print(f"[ошибка сети] не удалось обратиться к LayerZero Scan API: {e}", file=sys.stderr)
+        return []
+
+    if resp.status_code == 404:
+        return []
+    if resp.status_code != 200:
+        print(f"[ошибка API] LayerZero Scan вернул HTTP {resp.status_code}: {resp.text[:300]}",
+              file=sys.stderr)
+        return []
+
+    body = resp.json()
+    data = body.get("data") if isinstance(body, dict) else body
+    return data or []
+
+
 def find_bridge_crossing(tx_hash: str, testnet: bool = False) -> dict[str, Any]:
     """
     Основная функция: по хэшу транзакции (на исходной сети) возвращает
-    структурированный результат сопоставления bridge entry / bridge exit.
+    структурированный результат сопоставления bridge entry / bridge exit —
+    ОДНОГО сообщения/хопа LayerZero. Многоходовые маршруты (Legacy Mesh —
+    USDT0 Transfer Hub через Arbitrum как хаб, см. bridge_exit.compose_*
+    ниже) собираются вызывающим кодом через повторный вызов этой функции на
+    compose_tx_hash — сама она себя не вызывает рекурсивно, остаётся
+    простым one-hop матчером (сигнатура позволяла рекурсию с самого начала,
+    реализация — в bridge_tracer.trace_full_path).
 
-    TODO (следующий шаг, не в этом MVP): рекурсивный вызов
-    find_bridge_crossing(destination_tx_hash) для многоходовых маршрутов —
-    сигнатура уже это позволяет.
+    LEGACY MESH: КАК ОБНАРУЖИТЬ HOP 2 (подтверждено живым запросом)
+    -----------------------------------------------------------------
+    USDT0 Transfer Hub может отправлять "составное" (composed) OFT-сообщение
+    вместо обычного — тогда после доставки Hop 1 на хаб (Arbitrum) LayerZero
+    автоматически исполняет compose-вызов, который сам является ОТДЕЛЬНЫМ,
+    самостоятельным LayerZero-сообщением (Hop 2: хаб -> реальная целевая
+    сеть). Найдено и проверено на реальных данных: `destination.lzCompose`
+    в сыром ответе API — `{"status": "N/A"}`, если хопа 2 нет (сообщение
+    было простым SEND, хаб — финальная точка), или `{"status": "SUCCEEDED",
+    "txs": [{"txHash": ...}, ...]}`, если Hop 2 состоялся — и это txHash
+    сам по себе успешно резолвится через find_bridge_crossing(), возвращая
+    полноценный отдельный bridge_entry/bridge_exit для хаб -> реальная сеть.
+    Без этой проверки трейсер останавливался бы на хабе как на "выходе из
+    моста", хотя на самом деле это середина пути.
+
+    Проверено конкретно на переводах С TRON (не только гипотетически):
+    отсканирован реестр сообщений OApp USDT0-на-Tron (/v1/messages/oapp/
+    30420/{hex}, ~500 сообщений с Tron как source) — среди них нашлось 30
+    реальных composed-переводов Tron -> Arbitrum -> дальше. Пример:
+    tx 0x9574bb18862313c80b4d5476d75170ea567f76d038386d3af77c0cdc1d540050
+    (Tron -> Arbitrum, compose_status=SUCCEEDED) -> compose-tx
+    0x1155a198e1ab7270f43841976946a72810661dd85be617e229d18288a663c917
+    сам резолвится как Hop 2 (Arbitrum -> xlayer, DELIVERED). Ещё один
+    пример с Hop 2 на Polygon: tx 0x91fd56bd84cde56c308eda9653b519b7a6f2020
+    532481886e9386244e1ba372b -> compose-tx 0x0a7870b9a23c1e5a827749e340e76
+    99ba5784b83b126121f8ac23abb21c4c4db (Arbitrum -> Polygon, DELIVERED).
     """
     msg = fetch_message(tx_hash, testnet=testnet)
     if msg is None:
@@ -470,6 +562,19 @@ def find_bridge_crossing(tx_hash: str, testnet: bool = False) -> dict[str, Any]:
             "oapp_address": oapp_address,
             "recipient_source": recipient_source,
             "amount_shared_decimals": oft_decoded["amount_shared_decimals"] if oft_decoded else None,
+            # Legacy Mesh Hop 2 (см. докстринг функции выше): compose_status
+            # "N/A" (или отсутствует) — обычное сообщение, эта bridge_exit
+            # финальна. Другой статус ("SUCCEEDED" и т.п.) с непустым
+            # compose_tx_hash — на destination-сети автоматически исполнился
+            # compose-вызов, который сам является следующим LayerZero-
+            # сообщением; вызывающий код должен продолжить
+            # find_bridge_crossing(compose_tx_hash), а не считать эту
+            # bridge_exit финальной точкой выхода из моста.
+            "compose_status": (destination.get("lzCompose") or {}).get("status"),
+            "compose_tx_hash": (
+                ((destination.get("lzCompose") or {}).get("txs") or [{}])[0].get("txHash")
+                if (destination.get("lzCompose") or {}).get("txs") else None
+            ),
             "timestamp": dest_tx.get("blockTimestamp"),
             # Человекочитаемый статус всегда отражает наличие destination tx hash,
             # а не сырой API-статус (например, "WAITING") — так однозначнее для

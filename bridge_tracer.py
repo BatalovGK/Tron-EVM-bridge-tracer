@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 """
 bridge_tracer.py — Layer 1: сквозной трейсер полного пути транзакции через
-мост LayerZero. Склеивает три независимых сетевых адаптера в один
+мост LayerZero. Склеивает два сетевых адаптера и LayerZero Scan API в один
 самодостаточный async-модуль:
 
-    TronGrid (aml/tron_adapter) -> LayerZero Scan (layerzero_tracer.py)
-        -> Blockscout Pro (aml/evm_adapter, любая EVM-сеть, куда пришёл мост)
+    LayerZero Scan (layerzero_tracer.py, messages/wallet — поиск депозита
+        на Tron) -> LayerZero Scan (find_bridge_crossing — сопоставление
+        входа/выхода моста) -> Blockscout Pro (aml/evm_adapter, любая
+        EVM-сеть, куда пришёл мост)
+
+Шаг 1 больше не использует tron_adapter как сетевой клиент (см. историю
+исправления в _find_tron_bridge_deposit ниже) — от него нужна только
+чистая утилита base58_to_hex, сети не требующая.
 
 Единая входная точка — trace_full_path(). Модуль не знает, кто его вызывает
 (CLI ниже — просто одна из обёрток, наравне с будущими agent/tools_bridge.py
@@ -29,10 +35,12 @@ Postgres + TheGraph там, где задача явно просит "MVP, бе
 
 ОГРАНИЧЕНИЯ ЭТОГО MVP (осознанно, см. definition of done в брифинге)
 -----------------------------------------------------------------------
-- Шаг 1 (TronGrid) распознаёт депозит в мост только по статическому
-  реестру TRON_BRIDGE_DEPOSIT_CONTRACTS ниже — сейчас там один адрес
-  (USDT0 OFT на Tron), подтверждённый живым запросом в этой сессии
-  (см. docstring find_real_tx в истории сессии и aml/tron_adapter/README.md).
+- Шаг 1 (поиск депозита через LayerZero Scan messages/wallet) распознаёт
+  депозит в мост только по реестру Tron-OApp из официального USDT0
+  Deployments API (usdt0_deployments.get_tron_oft_contracts(), фильтр по
+  pathway.sender.address) — сейчас там один адрес (USDT0 OFT на Tron).
+  Сообщения через другие OApp/протоколы с того же адреса пропускаются как
+  вне scope MVP.
 - Шаг 3 (evm_adapter) — линейный обход "один хоп = один самый ранний
   подходящий исходящий ERC-20-перевод", НЕ amount-aware taint-трейсинг
   (это другая, более объёмная задача — см. hop_tracer.py выше). Схема
@@ -81,38 +89,24 @@ if _AML_DIR not in sys.path:
 
 import layerzero_tracer as lz  # noqa: E402
 from known_contracts import lookup_contract  # noqa: E402
-from tron_adapter import (  # noqa: E402
-    get_trc20_transfers,
-    close_client as _close_tron_client,
-    addresses_equal,
-    normalize_tx_hash,
-)
+from tron_adapter import base58_to_hex  # noqa: E402
 from evm_adapter import get_token_transfers, close_client as _close_evm_client  # noqa: E402
-
-# Известные адреса LayerZero OApp-контрактов на исходных НЕ-EVM сетях —
-# нужны, чтобы распознать "этот исходящий TRC-20 Transfer — депозит в мост",
-# а не случайный перевод куда-то ещё. Для этого тестового задания достаточно
-# одного адреса (единственный сценарий, который демонстрируется — TRON ->
-# Ethereum через USDT0), но структура словаря готова к расширению на другие
-# OApp/сети без изменения кода.
-TRON_BRIDGE_DEPOSIT_CONTRACTS: dict[str, str] = {
-    # USDT0 OFT на Tron mainnet. Адрес подтверждён дважды живыми запросами в
-    # этой сессии: (1) docs.usdt0.to/api/deployments -> lzEid=30420, (2)
-    # обратное сопоставление через LayerZero Scan API
-    # /v1/messages/oapp/30420/{hex-адрес} нашло реальные DELIVERED-сообщения
-    # Tron<->Ethereum с этим контрактом как sender/receiver.
-    "TFG4wBaDQ8sHWWP1ACeSGnoNR6RRzevLPt": "USDT0 OFT (Tron)",
-}
+from usdt0_deployments import get_tron_oft_contracts  # noqa: E402
 
 DEFAULT_MAX_HOPS = 10
 MAX_EVM_TRANSFERS_PER_PAGE = 50
 ZERO_ADDRESS = "0x" + "0" * 40
+# Legacy Mesh (USDT0 Transfer Hub) документирован как ровно 2 хопа
+# LayerZero-сообщений (source -> Arbitrum-хаб -> реальная сеть) — предел
+# защитный, а не наблюдаемое значение, см. цикл в trace_full_path().
+MAX_BRIDGE_HOPS = 3
 
 
 async def close_clients() -> None:
-    """Закрывает aiohttp-сессии tron_adapter и evm_adapter. Вызывать один раз
-    по завершении работы с trace_full_path (см. main() ниже)."""
-    await _close_tron_client()
+    """Закрывает aiohttp-сессию evm_adapter. Вызывать один раз по завершении
+    работы с trace_full_path (см. main() ниже). tron_adapter здесь больше не
+    используется как сетевой клиент (see _find_tron_bridge_deposit) — только
+    его чистая утилита base58_to_hex, сети не требующая."""
     await _close_evm_client()
 
 
@@ -130,7 +124,8 @@ async def trace_full_path(
     Args:
         start: Tron-адрес отправителя (start_type="address") или хэш
             транзакции депозита в мост на Tron (start_type="tx_hash") —
-            во втором случае шаг 1 (TronGrid) пропускается.
+            во втором случае шаг 1 (поиск депозита через LayerZero Scan)
+            пропускается.
         start_type: "address" | "tx_hash".
         mode: пробрасывается в метаданные результата для совместимости с
             остальной платформой (aml/agent/tools_*.py тоже принимают mode);
@@ -152,12 +147,12 @@ async def trace_full_path(
                 final_status="NO_BRIDGE_DEPOSIT_FOUND",
                 hops=hops,
                 note=(
-                    f"Среди исходящих TRC-20 переводов с адреса {start} не найден "
-                    "депозит на известный bridge-контракт LayerZero (проверяется "
-                    "только реестр TRON_BRIDGE_DEPOSIT_CONTRACTS — сейчас в нём "
-                    "только USDT0 OFT). Либо адрес не связан с переводом через "
-                    "LayerZero, либо использован bridge-контракт вне текущего "
-                    "реестра, либо перевод старше окна выборки TronGrid."
+                    f"LayerZero Scan не нашёл ни одного сообщения, отправленного "
+                    f"(source) с адреса {start} через известный OApp (проверяется "
+                    "реестр из официального USDT0 Deployments API — сейчас в нём "
+                    "только USDT0 OFT на Tron). Либо адрес не связан с переводом "
+                    "через LayerZero, либо использован OApp/протокол вне текущего "
+                    "реестра."
                 ),
             )
         hops.append(deposit["hop"])
@@ -171,36 +166,55 @@ async def trace_full_path(
     # дизайну layerzero_tracer.py (независимый standalone-скрипт для BitOK).
     # Заворачиваем в отдельный поток, чтобы не блокировать event loop, в
     # котором крутятся асинхронные tron_adapter/evm_adapter.
-    crossing = await asyncio.to_thread(lz.find_bridge_crossing, bridge_tx_hash)
-    if not crossing["found"]:
-        return _flat_result(final_status="BRIDGE_MESSAGE_NOT_FOUND", hops=hops, note=crossing["note"])
+    #
+    # Legacy Mesh (USDT0 Transfer Hub через Arbitrum как хаб) может состоять
+    # из 2 сообщений LayerZero подряд: Hop 1 (source -> Arbitrum-хаб) и,
+    # если на хабе автоматически исполнился compose-вызов, Hop 2 (хаб ->
+    # реальная целевая сеть) — см. докстринг find_bridge_crossing() про
+    # compose_status/compose_tx_hash, подтверждено живым запросом в этой
+    # сессии. Без этого цикла трейсер останавливался бы на хабе как на
+    # "выходе из моста", хотя это середина пути. MAX_BRIDGE_HOPS — защитный
+    # предел (Legacy Mesh документирован ровно как 2 хопа), а не наблюдаемое
+    # значение — просто чтобы не зациклиться на аномальных данных.
+    current_bridge_tx_hash = bridge_tx_hash
+    crossing: dict[str, Any] = {}
+    for leg in range(1, MAX_BRIDGE_HOPS + 1):
+        crossing = await asyncio.to_thread(lz.find_bridge_crossing, current_bridge_tx_hash)
+        if not crossing["found"]:
+            return _flat_result(final_status="BRIDGE_MESSAGE_NOT_FOUND", hops=hops, note=crossing["note"])
 
-    hops.append({
-        "segment": "bridge",
-        "protocol": "LayerZero",
-        "from_chain": crossing["bridge_entry"]["chain"],
-        "from_address": crossing["bridge_entry"]["from_address"],
-        "from_tx_hash": crossing["bridge_entry"]["tx_hash"],
-        "to_chain": crossing["bridge_exit"]["chain"],
-        "to_address": crossing["bridge_exit"]["to_address"],
-        "to_tx_hash": crossing["bridge_exit"]["tx_hash"],
-        "guid": crossing["guid"],
-        "confidence": crossing["confidence"],
-        "status": crossing["message_status"],
-    })
+        hops.append({
+            "segment": "bridge",
+            "leg": leg,
+            "protocol": "LayerZero",
+            "from_chain": crossing["bridge_entry"]["chain"],
+            "from_address": crossing["bridge_entry"]["from_address"],
+            "from_tx_hash": crossing["bridge_entry"]["tx_hash"],
+            "to_chain": crossing["bridge_exit"]["chain"],
+            "to_address": crossing["bridge_exit"]["to_address"],
+            "to_tx_hash": crossing["bridge_exit"]["tx_hash"],
+            "guid": crossing["guid"],
+            "confidence": crossing["confidence"],
+            "status": crossing["message_status"],
+        })
+
+        if crossing["bridge_exit"]["tx_hash"] is None:
+            return _flat_result(
+                final_status="IN_TRANSIT",
+                hops=hops,
+                final_chain=crossing["bridge_exit"]["chain"],
+                final_address=crossing["bridge_exit"]["to_address"],
+                note=crossing["note"],
+            )
+
+        compose_tx_hash = crossing["bridge_exit"].get("compose_tx_hash")
+        if not compose_tx_hash:
+            break  # финальный хоп: обычное сообщение, либо Legacy Mesh Hop 2 уже пройден
+        current_bridge_tx_hash = compose_tx_hash
 
     dest_chain_name = crossing["bridge_exit"]["chain"]
     recipient = crossing["bridge_exit"]["to_address"]
     dest_tx_hash = crossing["bridge_exit"]["tx_hash"]
-
-    if dest_tx_hash is None:
-        return _flat_result(
-            final_status="IN_TRANSIT",
-            hops=hops,
-            final_chain=dest_chain_name,
-            final_address=recipient,
-            note=crossing["note"],
-        )
 
     dest_eid = crossing["bridge_exit"]["eid"]
     if not lz.is_evm_chain(dest_eid):
@@ -243,40 +257,69 @@ async def trace_full_path(
 
 async def _find_tron_bridge_deposit(tron_address: str) -> Optional[dict[str, Any]]:
     """
-    Ищет среди исходящих TRC-20 Transfer-событий адреса перевод на известный
-    bridge-контракт (TRON_BRIDGE_DEPOSIT_CONTRACTS). TronGrid по умолчанию
-    отдаёт события по убыванию времени, поэтому первое совпадение — самый
-    свежий депозит.
+    Находит депозит в мост LayerZero, отправленный с данного Tron-адреса —
+    через LayerZero Scan (messages/wallet), а НЕ через угадывание по TronGrid.
+
+    ПОЧЕМУ НЕ TronGrid (история, обнаружено живым запуском)
+    -----------------------------------------------------------
+    Первая версия искала среди исходящих TRC-20 Transfer-событий адреса
+    (через tron_adapter.get_trc20_transfers) перевод, идущий НАПРЯМУЮ на
+    известный bridge-контракт (TRON_BRIDGE_DEPOSIT_CONTRACTS). На реальном
+    адресе, взятом прямо со страницы LayerZero Scan для подтверждённого
+    DELIVERED-сообщения Tron -> Arbitrum, это дало ложноотрицательный
+    NO_BRIDGE_DEPOSIT_FOUND: пользователь перевёл USDT не напрямую на OFT-
+    контракт, а через промежуточный router-контракт (подтверждено разбором
+    сырых event-логов транзакции через TronGrid gettransactioninfobyid) —
+    прямого Transfer от пользователя на известный контракт просто не
+    существовало, хотя сообщение LayerZero было реально отправлено и
+    доставлено. Эвристика "прямой перевод на известный контракт" в принципе
+    не может покрыть произвольную глубину промежуточных router/aggregator-
+    контрактов без отдельного рекурсивного разбора внутренних переводов
+    каждой транзакции — что не входит в scope MVP.
+
+    Вместо этого используем layerzero_tracer.find_messages_by_wallet() —
+    LayerZero Scan уже знает итоговый tx хэш и настоящего отправителя
+    (source.tx.from, то же поле, что find_bridge_crossing() предпочитает
+    pathway.sender.address — см. его докстринг) независимо от того, сколько
+    контрактов было между пользователем и OFT.
+
+    Реестр известных Tron-OApp (фильтр "это сообщение через USDT0, а не
+    какой-то другой протокол вне scope MVP") — больше не захардкожен, а
+    берётся живым запросом (с диск-кэшем) к официальному USDT0 Deployments
+    API через usdt0_deployments.get_tron_oft_contracts() — см. этот модуль,
+    почему.
     """
-    result = await get_trc20_transfers(address=tron_address, only_from=True, limit=200)
-    for item in result.get("data", []):
-        if item.get("type") != "Transfer":
-            continue  # TronGrid отдаёт в одном списке и Transfer, и Approval
-        to_addr = item.get("to")
-        if to_addr is None:
+    hex_addr = "0x" + base58_to_hex(tron_address)
+    messages, tron_contracts = await asyncio.gather(
+        asyncio.to_thread(lz.find_messages_by_wallet, hex_addr),
+        asyncio.to_thread(get_tron_oft_contracts),
+    )
+    tron_contracts_hex = {("0x" + base58_to_hex(addr)).lower(): name for addr, name in tron_contracts.items()}
+
+    for msg in messages:
+        pathway = msg.get("pathway") or {}
+        if pathway.get("srcEid") != 30420:
+            continue  # это сообщение НА Tron (адрес — receiver), не депозит С Tron
+
+        sender_hex = ((pathway.get("sender") or {}).get("address") or "").lower()
+        oapp_name = tron_contracts_hex.get(sender_hex)
+        if oapp_name is None:
+            continue  # сообщение через OApp вне текущего реестра — вне scope MVP
+
+        source_tx = (msg.get("source") or {}).get("tx") or {}
+        tx_hash = source_tx.get("txHash")
+        if not tx_hash:
             continue
-        matched_name = next(
-            (name for bridge_addr, name in TRON_BRIDGE_DEPOSIT_CONTRACTS.items()
-             if addresses_equal(to_addr, bridge_addr)),
-            None,
-        )
-        if matched_name is None:
-            continue
-        tx_hash = "0x" + normalize_tx_hash(item["transaction_id"])
-        token_info = item.get("token_info") or {}
+
         return {
             "tx_hash": tx_hash,
             "hop": {
                 "segment": "tron_deposit",
                 "chain": "Tron",
-                "from_address": item.get("from"),
-                "to_address": to_addr,
-                "to_label": matched_name,
+                "from_address": source_tx.get("from"),
+                "oapp": oapp_name,
                 "tx_hash": tx_hash,
-                "token_symbol": token_info.get("symbol"),
-                "value_raw": item.get("value"),
-                "value_decimals": token_info.get("decimals"),
-                "timestamp": item.get("block_timestamp"),
+                "timestamp": source_tx.get("blockTimestamp"),
             },
         }
     return None
@@ -481,7 +524,7 @@ async def _main_async(args: argparse.Namespace) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Сквозной трейсер пути транзакции: TronGrid -> LayerZero -> Blockscout Pro (EVM)"
+        description="Сквозной трейсер пути транзакции: LayerZero Scan (Tron) -> LayerZero Scan (bridge) -> Blockscout Pro (EVM)"
     )
     parser.add_argument("--start", required=True, help="Tron-адрес отправителя или хэш депозитной tx на Tron")
     parser.add_argument("--start-type", choices=["address", "tx_hash"], default="address")

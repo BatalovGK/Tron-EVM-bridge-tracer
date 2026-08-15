@@ -18,6 +18,9 @@ venv/
 *.db
 *.db-journal
 
+# Local disk cache of usdt0_deployments.py (live-fetched, re-derivable)
+.usdt0_deployments_cache.json
+
 # OS / editor cruft
 .DS_Store
 Thumbs.db

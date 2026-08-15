@@ -11,9 +11,16 @@
 принимает EIP-155 chain_id — у Tron такой размерности просто нет).
 
 Этот модуль НЕ знает про мосты, LayerZero или Bridge Contract Registry — это
-чистый network adapter (как и evm_adapter). Логика "это тот самый bridge-
-контракт или нет" живёт в bridge_tracer.py (Layer 1 orchestrator), который
-фильтрует результат get_trc20_transfers() по адресу.
+чистый network adapter (как и evm_adapter). Обнаружение депозита в мост
+живёт в bridge_tracer.py (Layer 1 orchestrator) — НЕ через этот модуль:
+первая версия фильтровала результат get_trc20_transfers() по адресу
+известного bridge-контракта, но живой запуск нашёл на ней ложноотрицательный
+случай (депозит через промежуточный router-контракт, не прямой TRC-20
+Transfer), поэтому обнаружение депозита переведено на LayerZero Scan
+(messages/wallet) — см. docstring _find_tron_bridge_deposit в
+bridge_tracer.py. get_trc20_transfers() из этого модуля остаётся общей
+функцией адаптера (используется в других сценариях), просто bridge_tracer.py
+её для этой конкретной задачи больше не вызывает.
 """
 
 from datetime import datetime, timezone
