@@ -720,12 +720,14 @@ async def _walk_evm(
 
     # Легитимные адреса контрактов стейблкоинов на этой сети (см. docstring
     # legit_tokens.py): статический реестр (USDT/USDC, проверено по
-    # первоисточникам Tether/Circle) + роль "Token" из уже загруженного выше
-    # USDT0 Deployments API (для Arbitrum/Polygon/Optimism, где USDT физически
-    # стал USDT0-контрактом — переиспользуем registry_entries, без нового
-    # сетевого запроса). Пусто для сети без покрытия ни одним источником
-    # (напр. BNB Chain) — тогда фильтр ниже безопасно НЕ применяется вовсе
-    # (fallback = прежнее поведение), а не отбрасывает все кандидаты подряд.
+    # первоисточникам Tether/Circle/BscScan) + роль "Token" из уже
+    # загруженного выше USDT0 Deployments API (для Arbitrum/Polygon/Optimism,
+    # где USDT физически стал USDT0-контрактом — переиспользуем
+    # registry_entries, без нового сетевого запроса). Пусто, если ни один из
+    # источников не покрывает конкретный ТОКЕН на этой сети (напр. USDC на
+    # BNB Chain — не проверялся, см. legit_tokens.py) — тогда фильтр ниже
+    # безопасно НЕ применяется вовсе (fallback = прежнее поведение), а не
+    # отбрасывает все кандидаты подряд.
     legit_token_addresses: dict[str, str] = dict(legit_tokens.LEGIT_TOKEN_CONTRACTS.get(chain_id, {}))
     for e in registry_entries:
         if e.get("contract_role") == "Token":

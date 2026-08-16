@@ -31,19 +31,34 @@ Blockscout на живом USDT0-получателе (0xb7cc792b3af4bf6afc35053
 использован в диагностике этой сессии) подтвердил точное совпадение
 token.address_hash с этим адресом.
 
-ПОЧЕМУ BNB CHAIN ОТСУТСТВУЕТ ПОЛНОСТЬЮ (ни USDT, ни USDC)
---------------------------------------------------------------
-Не "не хватило времени проверить" — явно исключено по первоисточникам:
-  - USDT: официальная страница Tether не перечисляет USD₮ для BNB Smart
-    Chain вообще (только XAU₮). USDT0 Deployments API тоже не содержит
-    записей для chain_id=56 (проверено живым запросом в этой сессии).
-  - USDC: официальная документация Circle (developers.circle.com/
-    stablecoins/usdc-contract-addresses) не перечисляет BNB Chain среди
-    сетей нативного выпуска USDC.
-Отсутствие фильтра для сети — безопасный fallback (фильтр там просто не
-применяется, как раньше). Внесение неверного адреса было бы хуже: дало бы
-ложную уверенность и могло отфильтровать легитимный перевод как поддельный
-или пропустить подделку как легитимную.
+BNB CHAIN: USDT ЕСТЬ (Binance-Peg), USDC ОТСУТСТВУЕТ
+----------------------------------------------------------
+BNB Chain не покрыта ни официальной страницей Tether (USD₮ там не
+перечислен вообще, только XAU₮), ни USDT0 Deployments API (пустой список
+для chain_id=56, проверено живым запросом в этой сессии) — то есть у
+Tether Ltd там нет СОБСТВЕННОГО выпуска USDT. Но де-факто каноническим
+"USDT" на BNB Chain выступает Binance-Peg BSC-USD — контракт
+0x55d398326f99059fF775485246999027B3197955, эмпирически подтверждено
+через реальную входящую транзакцию с Bybit + проверку на BscScan
+2026-08-16: официальные теги самого BscScan "Token Contract"/"Binance-Peg"/
+"Stablecoin", TokenTracker-имя "Binance-Peg BSC-USD (BSC-USD)", "Source
+Code Verified — Exact Match" (контракт BEP20USDT), аудит (Etherauthority,
+апрель 2025), задеплоен ~6 лет назад. Тот же стандарт доказательности, что
+уже применялся в known_contracts.py ("сверен живым поиском по публичным
+name tags Etherscan" — здесь: BscScan). ВАЖНО: это НЕ выпуск самого Tether
+Ltd, а пег-механизм Binance (Project Token Canal, по описанию самого
+BscScan) — категориально отличается от Arbitrum/Polygon/Optimism-случая
+(там источник — официальный протокольный реестр USDT0, first-party к
+продукту), поэтому символ в реестре ниже помечен как "USDT (Binance-Peg)",
+не просто "USDT".
+
+USDC на BNB Chain НЕ включён: официальная документация Circle не
+перечисляет BNB Chain среди сетей нативного выпуска — а раз Circle сам не
+подтверждает выпуск, любой "USDC" на BSC тоже был бы сторонним пегом,
+требующим ТОЙ ЖЕ отдельной проверки (реальная tx + explorer-тег), которая
+для USDC пока не проводилась. Отсутствие фильтра — безопасный fallback
+(фильтр просто не применяется для USDC на этой сети, как раньше). Внесение
+неверного/непроверенного адреса было бы хуже: дало бы ложную уверенность.
 
 ПОЧЕМУ BASE ОТСУТСТВУЕТ ДЛЯ USDT (НО ЕСТЬ ДЛЯ USDC)
 --------------------------------------------------------
@@ -61,12 +76,16 @@ LEGIT_TOKEN_CONTRACTS: {evm_chain_id: {адрес в нижнем регистр
 
 ИСТОЧНИКИ (сверено живым запросом в этой сессии, не по памяти)
 ------------------------------------------------------------------
-  - USDT Ethereum:  tether.to/en/supported-protocols -> etherscan.io/address/0xdac17f958d2ee523a2206206994597c13d831ec7
-  - USDC Ethereum:  developers.circle.com/stablecoins/usdc-contract-addresses
-  - USDC Polygon:   developers.circle.com/stablecoins/usdc-contract-addresses
-  - USDC Arbitrum:  developers.circle.com/stablecoins/usdc-contract-addresses
-  - USDC Optimism:  developers.circle.com/stablecoins/usdc-contract-addresses
-  - USDC Base:      developers.circle.com/stablecoins/usdc-contract-addresses
+  - USDT Ethereum:        tether.to/en/supported-protocols -> etherscan.io/address/0xdac17f958d2ee523a2206206994597c13d831ec7
+  - USDC Ethereum:        developers.circle.com/stablecoins/usdc-contract-addresses
+  - USDC Polygon:         developers.circle.com/stablecoins/usdc-contract-addresses
+  - USDC Arbitrum:        developers.circle.com/stablecoins/usdc-contract-addresses
+  - USDC Optimism:        developers.circle.com/stablecoins/usdc-contract-addresses
+  - USDC Base:            developers.circle.com/stablecoins/usdc-contract-addresses
+  - USDT BNB Chain:       bscscan.com/token/0x55d398326f99059ff775485246999027b3197955
+                          (Binance-Peg BSC-USD) — эмпирически подтверждено
+                          реальной транзакцией с Bybit + проверкой тегов
+                          BscScan, 2026-08-16.
 Снято 2026-08-16.
 """
 
@@ -76,6 +95,9 @@ LEGIT_TOKEN_CONTRACTS: dict[int, dict[str, str]] = {
     1: {  # Ethereum mainnet
         "0xdac17f958d2ee523a2206206994597c13d831ec7": "USDT",
         "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48": "USDC",
+    },
+    56: {  # BNB Chain — только USDT (Binance-Peg), USDC не проверен, см. докстринг
+        "0x55d398326f99059ff775485246999027b3197955": "USDT (Binance-Peg)",
     },
     137: {  # Polygon PoS
         "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359": "USDC",
@@ -89,7 +111,6 @@ LEGIT_TOKEN_CONTRACTS: dict[int, dict[str, str]] = {
     8453: {  # Base
         "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913": "USDC",
     },
-    # 56 (BNB Chain) намеренно отсутствует целиком — см. докстринг модуля.
 }
 
 
