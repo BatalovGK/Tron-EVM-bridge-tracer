@@ -771,6 +771,41 @@ def test_walk_evm_prefers_earliest_over_known_address_match():
     print("test_walk_evm_prefers_earliest_over_known_address_match: OK")
 
 
+def test_walk_evm_ignores_zero_value_candidates():
+    """0-value ERC-20 Transfer не может быть движением прослеживаемых средств
+    по определению (0 токенов не переместилось) — ERC-20 transfer(x, 0) не
+    требует баланса/allowance, что делает такие переводы бесплатным
+    инструментом для address-poisoning спама. Обнаружено живым запуском в
+    этой сессии: реальный адрес оказался address-poisoning-инфраструктурой
+    (~19% исходящих переводов — 0-value, см. README про известные
+    ограничения). Один 0-value кандидат РАНЬШЕ по времени и один настоящий
+    (ненулевой) ПОЗЖЕ — должен выбраться настоящий, а не более ранний ноль
+    (это не amount-aware сопоставление сумм между хопами, просто отсев
+    вырожденного случая "переместить было нечего")."""
+    start = "0x1000000000000000000000000000000000000a"
+    anchor = 1786800000.0
+
+    zero_value = _evm_transfer_item(start, "0x9999999999999999999999999999999999999f", tx_hash="0xzero")
+    zero_value["total"] = {"value": "0", "decimals": "6"}
+    zero_value["timestamp"] = _iso(anchor + 10)  # раньше настоящего перевода
+
+    real_transfer = _evm_transfer_item(start, "0x8888888888888888888888888888888888888e", tx_hash="0xreal")
+    real_transfer["total"] = {"value": "5000000", "decimals": "6"}
+    real_transfer["timestamp"] = _iso(anchor + 20)  # позже, но единственный ненулевой
+
+    page = _page([zero_value, real_transfer])
+    m_evm = AsyncMock(return_value=page)
+    m_registry = MagicMock(return_value=[])
+    with patch.object(bt, "get_token_transfers", m_evm), \
+         patch.object(bt.bridge_registry, "get_registry_for_evm_chain_id", m_registry):
+        result = _run(bt._walk_evm(1, start, max_hops=5, after_timestamp=anchor))
+
+    assert result["hops"][0]["tx_hash"] == "0xreal"
+    assert result["hops"][0]["value_raw"] == "5000000"
+    assert result["hops"][0]["to_address"] == "0x8888888888888888888888888888888888888e"
+    print("test_walk_evm_ignores_zero_value_candidates: OK")
+
+
 def test_walk_evm_finds_match_on_later_page_stops_pagination():
     """Совпадение с реестром находится только на условной 4-й странице —
     остановка должна произойти именно на ней, страницы 5+ не запрашиваются
@@ -994,6 +1029,7 @@ if __name__ == "__main__":
     test_non_evm_destination_stops_cleanly()
     test_start_type_tx_hash_skips_tron_step()
     test_walk_evm_prefers_earliest_over_known_address_match()
+    test_walk_evm_ignores_zero_value_candidates()
     test_walk_evm_finds_match_on_later_page_stops_pagination()
     test_walk_evm_search_depth_exceeded_when_no_match_within_page_cap()
     test_walk_evm_rested_at_address_via_early_exit_before_page_cap()

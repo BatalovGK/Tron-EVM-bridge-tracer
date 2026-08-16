@@ -721,6 +721,19 @@ async def _walk_evm(
                 item for item in page_items
                 if ((item.get("from") or {}).get("hash") or "").lower() == current.lower()
             ]
+            # 0-value ERC-20 Transfer не может быть движением прослеживаемых
+            # средств по определению (0 токенов не переместилось) — стандарт
+            # ERC-20 разрешает transfer(x, 0) БЕЗ баланса/allowance, что делает
+            # такие переводы бесплатным инструментом для address-poisoning
+            # спама. Обнаружено живым запуском в этой сессии: реальный адрес
+            # оказался address-poisoning-инфраструктурой (~19% исходящих
+            # переводов — 0-value на vanity-адреса с совпадающим
+            # префиксом/суффиксом, см. README, раздел "Известные
+            # ограничения"). Это НЕ amount-aware сопоставление сумм между
+            # хопами (которое мы сознательно не делаем) — просто вырожденный
+            # случай "переместить было нечего", не требует знать сумму
+            # предыдущего хопа.
+            outgoing = [item for item in outgoing if (item.get("total") or {}).get("value") != "0"]
             if not_before is not None:
                 outgoing = [
                     item for item in outgoing
