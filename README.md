@@ -1,8 +1,7 @@
 # Cross-Chain Bridge Tracer
 
 MVP-трейсер полного пути транзакции через кросс-чейн мост: TRON → LayerZero
-(USDT0) → произвольная EVM-сеть. Тестовое задание на позицию "blockchain
-analyst" (BitOK).
+(USDT0) → произвольная EVM-сеть.
 
 Единая точка входа — `bridge_tracer.trace_full_path()`:
 
