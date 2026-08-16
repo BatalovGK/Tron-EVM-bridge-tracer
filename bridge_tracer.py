@@ -883,7 +883,10 @@ async def _main_async(args: argparse.Namespace) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Сквозной трейсер пути транзакции: LayerZero Scan (Tron) -> LayerZero Scan (bridge) -> Blockscout Pro (EVM)"
+        description=(
+            "Сквозной трейсер пути транзакции: TronGrid, fallback LayerZero Scan "
+            "(депозит на Tron) -> LayerZero Scan (пересечение моста) -> Blockscout Pro (EVM)"
+        )
     )
     parser.add_argument("--start", required=True, help="Tron-адрес отправителя или хэш депозитной tx на Tron")
     parser.add_argument("--start-type", choices=["address", "tx_hash"], default="address")

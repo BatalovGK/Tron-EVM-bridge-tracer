@@ -53,8 +53,8 @@ python3 bridge_tracer.py --help
 usage: bridge_tracer.py [-h] --start START [--start-type {address,tx_hash}]
                         [--max-hops MAX_HOPS]
 
-Сквозной трейсер пути транзакции: LayerZero Scan (Tron) -> LayerZero Scan
-(bridge) -> Blockscout Pro (EVM)
+Сквозной трейсер пути транзакции: TronGrid, fallback LayerZero Scan (депозит
+на Tron) -> LayerZero Scan (пересечение моста) -> Blockscout Pro (EVM)
 
 options:
   -h, --help            show this help message and exit
