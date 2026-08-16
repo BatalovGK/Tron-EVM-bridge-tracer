@@ -661,6 +661,24 @@ async def _walk_evm(
     Blockscout сам подтвердил конец данных, next_page_params пуст, до
     исчерпания max_pages_per_hop). Различие важно: тихий ложный тупик хуже
     честного "не досмотрели".
+
+    РАННИЙ ВЫХОД: страница уже целиком раньше not_before
+    -----------------------------------------------------
+    Если на текущей странице не нашлось подходящего кандидата И самая свежая
+    запись НА ЭТОЙ СТРАНИЦЕ (max timestamp среди ВСЕХ её элементов, не
+    полагаемся на порядок элементов внутри страницы — порядок "свежие
+    первыми" здесь и в layerzero_tracer.py проверен живыми запросами, но
+    нигде не документирован как гарантия API) уже раньше not_before — более
+    старые страницы физически не могут содержать ничего новее (курсор
+    next_page_params идёт строго назад по времени между страницами — на этом
+    и так держится вся пагинация). В этом случае дальнейшая пагинация
+    бессмысленна: это ПОДТВЕРЖДЁННЫЙ тупик (RESTED_AT_ADDRESS), а не нехватка
+    глубины, даже если Blockscout формально предлагает ещё страницы —
+    обнаружено живым запуском в этой сессии (адрес, на который средства
+    моста пришли только что: все 4 доступные страницы целиком старше
+    прихода, потому что после прихода получатель ещё ничего не отправлял, а
+    прежний код честно долистал все 4 и ошибочно вернул SEARCH_DEPTH_EXCEEDED
+    вместо RESTED_AT_ADDRESS).
     """
     hops: list[dict[str, Any]] = []
     current = start_address
@@ -684,14 +702,16 @@ async def _walk_evm(
         cursor: Optional[dict[str, Any]] = None
         pages_fetched = 0
         hit_natural_end = False
+        crossed_before_arrival = False
         while pages_fetched < max_pages_per_hop:
             page = await get_token_transfers(
                 chain_id=chain_id, address=current, token_standard="ERC-20",
                 limit=MAX_EVM_TRANSFERS_PER_PAGE, cursor=cursor,
             )
             pages_fetched += 1
+            page_items = page.get("items", [])
             outgoing = [
-                item for item in page.get("items", [])
+                item for item in page_items
                 if ((item.get("from") or {}).get("hash") or "").lower() == current.lower()
             ]
             if not_before is not None:
@@ -705,6 +725,19 @@ async def _walk_evm(
                 next_transfer = min(outgoing, key=lambda it: _parse_iso_timestamp(it.get("timestamp")) or float("inf"))
                 break
 
+            if not_before is not None and page_items:
+                # max() по ВСЕМ элементам страницы, не полагаемся на порядок
+                # внутри страницы (см. докстринг функции, раздел "РАННИЙ ВЫХОД")
+                # — только на направление курсорной пагинации между страницами.
+                page_timestamps = [
+                    ts for it in page_items
+                    if (ts := _parse_iso_timestamp(it.get("timestamp"))) is not None
+                ]
+                if page_timestamps and max(page_timestamps) < not_before:
+                    hit_natural_end = True
+                    crossed_before_arrival = True
+                    break
+
             next_cursor = page.get("next_page_params")
             if not next_cursor:
                 hit_natural_end = True
@@ -713,9 +746,15 @@ async def _walk_evm(
 
         if next_transfer is None:
             if hit_natural_end:
+                note = (
+                    f"Просмотрено {pages_fetched} страниц(ы) Blockscout — самая свежая запись на "
+                    "последней уже раньше времени прихода средств, более старые страницы физически "
+                    "не могут содержать ничего новее. Подтверждённый тупик, не нехватка глубины "
+                    "(даже если Blockscout формально предлагал ещё страницы)."
+                ) if crossed_before_arrival else None
                 return await _with_observed_evm_name(
                     {"hops": hops, "final_status": "RESTED_AT_ADDRESS", "final_address": current,
-                     "final_tx_hash": current_tx_hash, "label": None},
+                     "final_tx_hash": current_tx_hash, "label": None, "note": note},
                     chain_id,
                 )
             return await _with_observed_evm_name(

@@ -742,9 +742,15 @@ def test_walk_evm_finds_match_on_later_page_stops_pagination():
 
     empty_before_anchor = [_page([], next_page_params={"cursor": "p2"})]  # стр.1: пусто после фильтра
     p2 = _page(
-        [{"from": {"hash": start}, "to": {"hash": "0x9999999999999999999999999999999999999f"},
+        # Входящий (не исходящий) перевод, ПОСЛЕ anchor — не проходит фильтр
+        # направления (а не времени), поэтому не триггерит ранний выход
+        # "страница целиком раньше not_before" (см. докстринг _walk_evm) —
+        # в реальном Blockscout курсор идёт строго назад по времени между
+        # страницами, так что более "поздняя" по пагинации страница не может
+        # содержать более свежую запись, чем предыдущая (в отличие от p4 ниже).
+        [{"from": {"hash": "0x9999999999999999999999999999999999999f"}, "to": {"hash": start},
           "transaction_hash": "0xnope", "total": {"value": "1", "decimals": "6"}, "token": {"symbol": "USDT"},
-          "timestamp": _iso(anchor - 500)}],  # ДО anchor -> не проходит фильтр
+          "timestamp": _iso(anchor + 5)}],
         next_page_params={"cursor": "p3"},
     )
     p3 = _page([], next_page_params={"cursor": "p4"})
@@ -769,23 +775,28 @@ def test_walk_evm_finds_match_on_later_page_stops_pagination():
 
 
 def test_walk_evm_search_depth_exceeded_when_no_match_within_page_cap():
-    """Подходящих кандидатов нет вообще вплоть до потолка страниц (каждая
-    просмотренная страница ещё имеет next_page_params, то есть данные не
-    исчерпаны, просто не хватило глубины) — должен вернуться
-    SEARCH_DEPTH_EXCEEDED, а НЕ RESTED_AT_ADDRESS (это разные вещи: "не
-    хватило глубины поиска" vs "дальше правда некуда идти")."""
+    """Настоящий сценарий "не хватило глубины": каждая страница целиком
+    ПОСЛЕ not_before (входящие переводы, идущие постоянно уже после прихода
+    моста), но ни один не подходит по направлению (это IN, не OUT с текущего
+    адреса) — граница not_before ни на одной из просмотренных страниц не
+    пересечена, next_page_params всегда есть. Ранний выход из докстринга
+    _walk_evm ("РАННИЙ ВЫХОД: страница уже целиком раньше not_before") здесь
+    НЕ должен сработать, потому что страницы не раньше not_before — это
+    честная нехватка бюджета, а не подтверждённый тупик. Должен вернуться
+    SEARCH_DEPTH_EXCEEDED, а НЕ RESTED_AT_ADDRESS."""
     start = "0x1000000000000000000000000000000000000a"
     anchor = 1786800000.0
 
-    def _stale_page(cursor_out):
+    def _fresh_incoming_page(page_index, cursor_out):
         return _page(
-            [{"from": {"hash": start}, "to": {"hash": "0x9999999999999999999999999999999999999f"},
-              "transaction_hash": "0xstale", "total": {"value": "1", "decimals": "6"}, "token": {"symbol": "USDT"},
-              "timestamp": _iso(anchor - 999)}],  # всегда ДО anchor -> никогда не проходит фильтр
+            [{"from": {"hash": "0x9999999999999999999999999999999999999f"}, "to": {"hash": start},
+              "transaction_hash": f"0xincoming{page_index}", "total": {"value": "1", "decimals": "6"},
+              "token": {"symbol": "USDT"},
+              "timestamp": _iso(anchor + 100 - page_index)}],  # всегда ПОСЛЕ anchor, но IN, не OUT
             next_page_params={"cursor": cursor_out},  # всегда "есть ещё"
         )
 
-    pages = [_stale_page(f"p{i}") for i in range(1, 6)]  # с запасом больше потолка
+    pages = [_fresh_incoming_page(i, f"p{i}") for i in range(1, 6)]  # с запасом больше потолка
     m_evm = AsyncMock(side_effect=pages)
     m_registry = MagicMock(return_value=[])
     with patch.object(bt, "get_token_transfers", m_evm), \
@@ -797,6 +808,38 @@ def test_walk_evm_search_depth_exceeded_when_no_match_within_page_cap():
     assert result["pages_examined"] == 3
     assert result["final_status"] != "RESTED_AT_ADDRESS"
     print("test_walk_evm_search_depth_exceeded_when_no_match_within_page_cap: OK")
+
+
+def test_walk_evm_rested_at_address_via_early_exit_before_page_cap():
+    """Ранний выход (см. докстринг _walk_evm, "РАННИЙ ВЫХОД"): страница 1
+    целиком раньше not_before (единственная запись на ней старше anchor),
+    но next_page_params формально не пуст — Blockscout утверждает, что
+    данные ещё есть. Раньше код честно долистал бы все max_pages_per_hop
+    страниц и вернул SEARCH_DEPTH_EXCEEDED; теперь должен остановиться
+    сразу после 1-й страницы с RESTED_AT_ADDRESS и явным note, потому что
+    более старые страницы физически не могут содержать ничего новее
+    not_before — обнаружено живым запуском в этой сессии на реальном
+    only-just-arrived адресе (см. диагностику этой сессии)."""
+    start = "0x1000000000000000000000000000000000000a"
+    anchor = 1786800000.0
+
+    p1 = _page(
+        [{"from": {"hash": start}, "to": {"hash": "0x9999999999999999999999999999999999999f"},
+          "transaction_hash": "0xstale", "total": {"value": "1", "decimals": "6"}, "token": {"symbol": "USDT"},
+          "timestamp": _iso(anchor - 999)}],  # ДО anchor -> не проходит фильтр
+        next_page_params={"cursor": "p2"},  # Blockscout утверждает, что есть ещё страницы
+    )
+
+    m_evm = AsyncMock(return_value=p1)  # если бы код запросил страницу 2 — это же значение вернулось бы снова
+    m_registry = MagicMock(return_value=[])
+    with patch.object(bt, "get_token_transfers", m_evm), \
+         patch.object(bt.bridge_registry, "get_registry_for_evm_chain_id", m_registry):
+        result = _run(bt._walk_evm(1, start, max_hops=5, after_timestamp=anchor, max_pages_per_hop=4))
+
+    assert m_evm.call_count == 1  # НЕ долистали до потолка (4) — остановились сразу
+    assert result["final_status"] == "RESTED_AT_ADDRESS"
+    assert result["note"] is not None and "не хватило глубины" not in result["note"].lower()
+    print("test_walk_evm_rested_at_address_via_early_exit_before_page_cap: OK")
 
 
 def test_walk_evm_rested_at_address_when_pages_genuinely_exhausted():
@@ -911,6 +954,7 @@ if __name__ == "__main__":
     test_walk_evm_prefers_earliest_over_known_address_match()
     test_walk_evm_finds_match_on_later_page_stops_pagination()
     test_walk_evm_search_depth_exceeded_when_no_match_within_page_cap()
+    test_walk_evm_rested_at_address_via_early_exit_before_page_cap()
     test_walk_evm_rested_at_address_when_pages_genuinely_exhausted()
     test_observed_name_write_through_caches_after_first_lookup()
     test_observed_name_does_not_affect_final_status()
