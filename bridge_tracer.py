@@ -77,6 +77,7 @@ python3 bridge_tracer.py --start <tx_hash> --start-type tx_hash
 
 import argparse
 import asyncio
+import json
 import os
 import re
 import sys
@@ -1069,22 +1070,36 @@ def _flat_result(
 
 
 def print_result(result: dict[str, Any]) -> None:
-    print("=" * 70)
-    print("ПОЛНЫЙ ПУТЬ ТРАНЗАКЦИИ")
-    print("=" * 70)
+    """
+    Человекочитаемая сводка идёт в stderr, структурированный результат —
+    валидным JSON в stdout (json.dumps(..., ensure_ascii=False) — иначе
+    кириллица в note/finality_note/filtered_unknown_token_note превратилась
+    бы в нечитаемые \\uXXXX-escape'ы). Разделение по потокам — не косметика:
+    так `python3 bridge_tracer.py ... | jq .` работает НАПРЯМУЮ, без ручного
+    вычленения JSON-куска из смешанного вывода (человекочитаемые строки на
+    stdout сломали бы парсинг любым стандартным JSON-парсером/jq).
+    default=str в dumps — защитный fallback на случай несериализуемого поля
+    в будущем (сейчас все значения result — str/int/None/dict/list, ничего
+    вроде datetime не просачивается).
+    """
+    print("=" * 70, file=sys.stderr)
+    print("ПОЛНЫЙ ПУТЬ ТРАНЗАКЦИИ", file=sys.stderr)
+    print("=" * 70, file=sys.stderr)
     for i, hop in enumerate(result["hops"], start=1):
-        print(f"[{i}] {hop}")
-    print()
-    print(f"Итоговый статус:   {result['final_status']}")
-    print(f"Итоговая сеть:     {result['final_chain']}")
-    print(f"Итоговый адрес:    {result['final_address']}")
-    print(f"Итоговый tx hash:  {result['final_tx_hash']}")
+        print(f"[{i}] {hop}", file=sys.stderr)
+    print(file=sys.stderr)
+    print(f"Итоговый статус:   {result['final_status']}", file=sys.stderr)
+    print(f"Итоговая сеть:     {result['final_chain']}", file=sys.stderr)
+    print(f"Итоговый адрес:    {result['final_address']}", file=sys.stderr)
+    print(f"Итоговый tx hash:  {result['final_tx_hash']}", file=sys.stderr)
     if result["exchange_name"]:
-        print(f"Биржа:             {result['exchange_name']}")
+        print(f"Биржа:             {result['exchange_name']}", file=sys.stderr)
     if result["contract_label"]:
-        print(f"Контракт:          {result['contract_label']} ({result['contract_type']})")
+        print(f"Контракт:          {result['contract_label']} ({result['contract_type']})", file=sys.stderr)
     if result["note"]:
-        print(f"\nПримечание: {result['note']}")
+        print(f"\nПримечание: {result['note']}", file=sys.stderr)
+
+    print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
 
 
 async def _main_async(args: argparse.Namespace) -> None:
