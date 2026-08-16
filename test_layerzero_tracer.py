@@ -87,6 +87,17 @@ FAKE_MESSAGE_COMPOSED_WRONG_TYPE["data"][0]["source"]["tx"]["payload"] = _build_
     OFT_REAL_RECIPIENT, OFT_AMOUNT_SD, msg_type=b"\x00\x04"
 )
 
+# Тот же успешный перевод, но message.status.name == "CONFIRMING" — по
+# официальному определению LayerZero Scan (docs.layerzero.network/v2/tools/
+# layerzeroscan, проверено в этой сессии): "Destination transaction
+# submitted, waiting for finality". destination.tx.txHash УЖЕ непуст
+# (в отличие от FAKE_MESSAGE_INFLIGHT), но сообщение ещё не считается
+# финализированным — см. правку find_bridge_crossing() в этой сессии.
+FAKE_MESSAGE_CONFIRMING = json.loads(json.dumps(FAKE_MESSAGE_DELIVERED))
+FAKE_MESSAGE_CONFIRMING["data"][0]["status"] = {
+    "name": "CONFIRMING", "message": "Destination transaction submitted, waiting for finality",
+}
+
 FAKE_MESSAGE_INFLIGHT = {
     "data": [
         {
@@ -195,6 +206,23 @@ def test_composed_message_payload_not_misdecoded():
     print("\ntest_composed_message_payload_not_misdecoded: OK")
 
 
+def test_confirming_case_warns_about_unfinalized_destination():
+    """message_status="CONFIRMING" — destination tx_hash уже есть (delivered
+    в смысле "непустой tx_hash"), но LayerZero ещё не считает сообщение
+    финализированным. Раньше note затирался в None по факту одного лишь
+    непустого tx_hash, независимо от message_status — предупреждение о
+    риске нефинализированных данных (теоретический реорг destination tx)
+    терялось полностью. Обнаружено живым запуском в этой сессии."""
+    with patch("requests.get", new=_mock_get(FAKE_MESSAGE_CONFIRMING)):
+        result = lz.find_bridge_crossing("tron_source_tx_hash")
+    assert result["message_status"] == "CONFIRMING"
+    assert result["bridge_exit"]["tx_hash"] is not None  # tx на destination уже есть...
+    assert result["bridge_exit"]["status"] == "DELIVERED"  # ...человекочитаемый статус это отражает
+    assert result["note"] is not None
+    assert "финализ" in result["note"].lower()
+    print("\ntest_confirming_case_warns_about_unfinalized_destination: OK")
+
+
 def test_inflight_case():
     with patch("requests.get", new=_mock_get(FAKE_MESSAGE_INFLIGHT)):
         result = lz.find_bridge_crossing("tron_source_tx_inflight")
@@ -241,6 +269,7 @@ if __name__ == "__main__":
     test_no_compose_reports_na()
     test_legacy_mesh_hop2_compose_surfaced()
     test_composed_message_payload_not_misdecoded()
+    test_confirming_case_warns_about_unfinalized_destination()
     test_inflight_case()
     test_missing_payload_falls_back_to_oapp_address()
     test_not_found_case()

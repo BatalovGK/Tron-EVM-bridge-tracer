@@ -227,6 +227,13 @@ async def trace_full_path(
             # внутри логики ветвления, чтобы оно было видно в hops[] независимо
             # от исхода.
             "compose_status": compose_status,
+            # Непусто, если this leg ещё не финализирован по LayerZero (напр.
+            # message_status="CONFIRMING" при уже непустом to_tx_hash) — см.
+            # find_bridge_crossing(). Пишем в КАЖДЫЙ bridge-хоп, не только в
+            # финальный note результата — иначе предупреждение о leg'е внутри
+            # compose-цепочки (Legacy Mesh) потерялось бы, если следующий leg
+            # уже финализирован.
+            "finality_note": crossing["note"],
         })
 
         if crossing["bridge_exit"]["tx_hash"] is None:

@@ -74,6 +74,22 @@ def _crossing_inflight():
     return d
 
 
+def _crossing_confirming(to_address="0x000000000000000000000000000000000000aa"):
+    """message_status="CONFIRMING" (по официальному определению LayerZero
+    Scan — "Destination transaction submitted, waiting for finality"):
+    destination tx_hash УЖЕ непуст (bridge_exit.status == "DELIVERED" в
+    человекочитаемом смысле "tx существует"), но сообщение ещё не
+    финализировано — см. правку find_bridge_crossing() в этой сессии."""
+    d = _crossing_delivered(to_address=to_address)
+    d["message_status"] = "CONFIRMING"
+    d["note"] = (
+        "Транзакция на целевой сети уже отправлена (destination tx_hash есть), "
+        "но LayerZero ещё не считает сообщение финализированным "
+        "(status='CONFIRMING', ожидается 'DELIVERED') — waiting for finality."
+    )
+    return d
+
+
 def _crossing_compose_failed(to_address="0x000000000000000000000000000000000000aa"):
     """Legacy Mesh Hop 1 доставлен на хаб, но compose (Hop 2) НЕ исполнился
     успешно — реальный случай, найденный живым запуском (tx
@@ -266,6 +282,31 @@ def test_full_path_dead_end():
     assert result["exchange_name"] is None
     assert result["contract_label"] is None
     print("test_full_path_dead_end: OK")
+
+
+def test_confirming_bridge_leg_finality_note_propagated_to_hop():
+    """message_status="CONFIRMING" (destination tx_hash уже есть, но
+    LayerZero ещё не считает сообщение финализированным) — раньше note
+    из find_bridge_crossing() затирался в None по факту одного лишь
+    непустого tx_hash, независимо от message_status, и предупреждение о
+    риске нефинализированных данных терялось полностью. Теперь оно должно
+    попасть В КАЖДЫЙ bridge-хоп как hop['finality_note'] (обнаружено живым
+    запуском в этой сессии)."""
+    recipient = "0x000000000000000000000000000000000000aa"
+    p1, p2, p3, p4, p5, p6, p7, p8, p9 = _patched(
+        wallet_messages=_wallet_messages_response(),
+        crossing=_crossing_confirming(to_address=recipient),
+        evm_pages={},
+    )
+    with p1, p2, p3, p4, p5, p6, p7, p8, p9:
+        result = _run(bt.trace_full_path(TRON_SENDER))
+
+    bridge_hops = [h for h in result["hops"] if h.get("segment") == "bridge"]
+    assert len(bridge_hops) == 1
+    assert bridge_hops[0]["status"] == "CONFIRMING"
+    assert bridge_hops[0]["finality_note"] is not None
+    assert "финализ" in bridge_hops[0]["finality_note"].lower()
+    print("test_confirming_bridge_leg_finality_note_propagated_to_hop: OK")
 
 
 def test_full_path_max_hops_reached():
@@ -933,6 +974,7 @@ if __name__ == "__main__":
     test_full_path_rests_at_exchange()
     test_full_path_rests_at_dex_contract()
     test_full_path_dead_end()
+    test_confirming_bridge_leg_finality_note_propagated_to_hop()
     test_full_path_max_hops_reached()
     test_full_path_stops_on_same_tx_multi_leg_swap()
     test_full_path_stops_on_burn_to_zero_address()

@@ -584,13 +584,39 @@ def find_bridge_crossing(tx_hash: str, testnet: bool = False) -> dict[str, Any]:
             "status": "DELIVERED" if delivered else "NOT DELIVERED YET",
             "raw_status": destination.get("status"),
         },
-        "note": None if delivered else (
+        # note: три исхода, не два — наличие dest tx_hash (`delivered`) само
+        # по себе НЕ значит "финализировано". По официальному определению
+        # LayerZero Scan (docs.layerzero.network/v2/tools/layerzeroscan,
+        # проверено в этой сессии): CONFIRMING = "Destination transaction
+        # submitted, waiting for finality" — tx на целевой сети уже
+        # существует (destination.tx.txHash непуст, delivered=True), но
+        # LayerZero ещё не считает сообщение доставленным окончательно.
+        # Раньше note затиралось в None при первом же непустом tx_hash,
+        # независимо от top_status — теряя единственное предупреждение о
+        # том, что дальнейший пост-bridge обход может опираться на ещё не
+        # финализированную транзакцию (риск реорга, небольшой, но
+        # ненулевой). Обнаружено живым запуском в этой сессии
+        # (message_status="CONFIRMING", tx_hash уже непуст).
+        "note": (
             "Сообщение отправлено и проходит верификацию DVN (Decentralized "
             "Verifier Network), но ещё не исполнено (lzReceive) на целевой "
             "сети. Это НЕ означает, что перевод завис: типичное время "
             "доставки для LayerZero V2 — от секунд до нескольких минут в "
             "зависимости от требуемого числа подтверждений на исходной сети "
             "и от того, сколько DVN настроено в конфигурации пути."
+        ) if not delivered else (
+            None if top_status == "DELIVERED" else (
+                f"Транзакция на целевой сети уже отправлена (destination "
+                f"tx_hash есть), но LayerZero ещё не считает сообщение "
+                f"финализированным (status={top_status!r}, ожидается "
+                "'DELIVERED') — по официальному определению LayerZero Scan "
+                "это 'waiting for finality': до финализации теоретически "
+                "возможен реорг транзакции на целевой сети (риск обычно "
+                "небольшой и зависит от конкретной сети, но ненулевой). "
+                "Любые дальнейшие хопы пост-bridge обхода, найденные после "
+                "этого перехода, построены поверх ещё не финализированных "
+                "данных."
+            )
         ),
     }
     return result
