@@ -754,7 +754,13 @@ async def _walk_evm(
     Оба обнаружены живым запуском на реальном address-poisoning-адресе в
     этой сессии — см. README, раздел "Известные ограничения". Отфильтрованные
     кандидаты не пропадают молча: счётчик/пример попадает в
-    hop["filtered_unknown_token_note"].
+    hop["filtered_unknown_token_note"] — с ДВУМЯ разными формулировками:
+    "вероятная подделка", если заявленный символ ТОЧНО совпадает с
+    отслеживаемым тикером (USDT/USDC) при чужом адресе, и нейтральное "вне
+    scope реестра", если символ вообще другой (напр. WETH — реальный,
+    легитимный, просто не стейблкоин). Обнаружено живым запуском в этой
+    сессии: WETH отфильтровался под старую формулировку "возможна
+    подделка" — некорректно для реального легитимного токена вне scope.
     """
     hops: list[dict[str, Any]] = []
     current = start_address
@@ -781,6 +787,11 @@ async def _walk_evm(
     for e in registry_entries:
         if e.get("contract_role") == "Token":
             legit_token_addresses.setdefault(e["address"].lower(), e.get("protocol", "USDT0"))
+    # Базовые тикеры, которые реестр реально отслеживает на этой сети (без
+    # уточнений вроде "(Binance-Peg)") — используется ТОЛЬКО для формулировки
+    # filtered_unknown_token_note ниже (см. её докстринг), не для самого
+    # отбора кандидатов.
+    tracked_symbols = {v.split(" ")[0].upper() for v in legit_token_addresses.values()}
 
     for hop_number in range(1, max_hops + 1):
         label = _known_evm_label(chain_id, current, registry_by_address)
@@ -911,13 +922,38 @@ async def _walk_evm(
         filtered_unknown_token_note: Optional[str] = None
         if filtered_unknown_token_count:
             example_token = (filtered_unknown_token_example or {}).get("token") or {}
+            example_symbol = (example_token.get("symbol") or "").strip().upper()
+            tracked_list = ", ".join(sorted(tracked_symbols))
+            # Два разных вердикта по одному дешёвому признаку — точное (без
+            # учёта регистра) совпадение символа с отслеживаемым тикером —
+            # НЕ эвристика на похожесть (Левенштейн/юникод-нормализация
+            # сознательно не делаем, риск ложных срабатываний на обычных
+            # токенах выше пользы). Гомоглифы ("ÚSDТ" и т.п.) НЕ ловятся этой
+            # проверкой и попадают в нейтральную ветку — честно, а не
+            # излишне уверенно. Обнаружено живым запуском в этой сессии:
+            # WETH (реальный, широко известный контракт) отфильтровался как
+            # "вне реестра" (реестр покрывает только USDT/USDC) — старая
+            # формулировка "возможна подделка" была для него некорректна.
+            if example_symbol in tracked_symbols:
+                verdict = (
+                    f"заявленный символ {example_token.get('symbol')!r} совпадает с отслеживаемым "
+                    f"тикером ({tracked_list}), но адрес контракта — другой: два разных контракта не "
+                    "могут оба честно быть официальным токеном с этим тикером. Вероятная подделка "
+                    "(юникод-гомоглиф символа или скам-токен, выдающий себя за отслеживаемый)."
+                )
+            else:
+                verdict = (
+                    f"символ {example_token.get('symbol')!r} не входит в текущий узкий реестр "
+                    f"legit_tokens.py (отслеживаются только {tracked_list} на этой сети) — НЕ "
+                    "обязательно подделка, может быть просто другой легитимный токен вне scope "
+                    "(напр. WETH/DAI/другой)."
+                )
             filtered_unknown_token_note = (
                 f"Отфильтровано {filtered_unknown_token_count} кандидат(ов) на этом хопе — адрес токен-"
                 "контракта не найден в реестре легитимных (legit_tokens.py) для этой сети, напр. symbol="
                 f"{example_token.get('symbol')!r} address_hash={example_token.get('address_hash')!r} "
-                f"tx={filtered_unknown_token_example.get('transaction_hash')!r}. Возможна подделка "
-                "(юникод-гомоглиф символа или неизвестный/скам-токен) — не amount-aware сопоставление, "
-                "просто адрес контракта не совпал ни с одним известным официальным."
+                f"tx={filtered_unknown_token_example.get('transaction_hash')!r}. {verdict} Не amount-aware "
+                "сопоставление сумм между хопами — просто отбор по адресу контракта, а не по значению."
             )
 
         if to_addr.lower() == ZERO_ADDRESS:

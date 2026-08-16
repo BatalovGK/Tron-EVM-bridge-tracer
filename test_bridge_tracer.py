@@ -915,9 +915,11 @@ def test_walk_evm_ignores_unknown_token_contract_candidates():
     подделать нельзя (Blockscout резолвит symbol/name ИЗ САМОГО контракта).
     Один кандидат РАНЬШЕ по времени с адресом ВНЕ реестра легитимных
     (legit_tokens.py) и один легитимный ПОЗЖЕ — должен выбраться легитимный,
-    а не более ранняя подделка; filtered_unknown_token_note должен объяснять,
-    что было отфильтровано (не amount-aware сопоставление сумм — просто
-    адрес контракта не совпал ни с одним известным официальным)."""
+    а не более ранняя подделка. "ÚSDТ" НЕ равен строкой "USDT" (юникод-
+    гомоглиф, не точное совпадение) — filtered_unknown_token_note поэтому
+    должен использовать НЕЙТРАЛЬНУЮ формулировку ("вне scope"), а не
+    "вероятная подделка" (см. test_walk_evm_flags_exact_symbol_match_as_
+    likely_spoof для случая точного совпадения символа)."""
     start = "0x1000000000000000000000000000000000000a"
     anchor = 1786800000.0
 
@@ -940,7 +942,73 @@ def test_walk_evm_ignores_unknown_token_contract_candidates():
     note = result["hops"][0]["filtered_unknown_token_note"]
     assert note is not None
     assert "ÚSDТ" in note
+    note_lower = note.lower()
+    assert "вне scope" in note_lower or "не обязательно подделка" in note_lower
+    assert "вероятная подделка" not in note_lower
     print("test_walk_evm_ignores_unknown_token_contract_candidates: OK")
+
+
+def test_walk_evm_flags_exact_symbol_match_as_likely_spoof():
+    """Кандидат с символом, ТОЧНО (без учёта регистра) совпадающим с
+    отслеживаемым тикером ("USDT"), но чужим адресом контракта — два разных
+    контракта не могут оба честно быть официальным USDT, значит это
+    осмысленно назвать "вероятной подделкой" (в отличие от гомоглифов и
+    вообще других токенов вроде WETH, для которых мы не можем это уверенно
+    утверждать — см. test_walk_evm_ignores_unknown_token_contract_candidates
+    и test_walk_evm_neutral_wording_for_out_of_scope_legit_token)."""
+    start = "0x1000000000000000000000000000000000000a"
+    anchor = 1786800000.0
+
+    fake_usdt = _evm_transfer_item(start, "0x9999999999999999999999999999999999999f", tx_hash="0xfake")
+    fake_usdt["token"] = {"symbol": "USDT", "address_hash": "0x000000000000000000000000000000deadbeef"}
+    fake_usdt["timestamp"] = _iso(anchor + 10)
+
+    legit = _evm_transfer_item(start, "0x8888888888888888888888888888888888888e", tx_hash="0xlegit")
+    legit["timestamp"] = _iso(anchor + 20)
+
+    page = _page([fake_usdt, legit])
+    m_evm = AsyncMock(return_value=page)
+    m_registry = MagicMock(return_value=[])
+    with patch.object(bt, "get_token_transfers", m_evm), \
+         patch.object(bt.bridge_registry, "get_registry_for_evm_chain_id", m_registry):
+        result = _run(bt._walk_evm(1, start, max_hops=5, after_timestamp=anchor))
+
+    note = result["hops"][0]["filtered_unknown_token_note"]
+    assert note is not None
+    assert "вероятная подделка" in note.lower()
+    print("test_walk_evm_flags_exact_symbol_match_as_likely_spoof: OK")
+
+
+def test_walk_evm_neutral_wording_for_out_of_scope_legit_token():
+    """Реальный, широко известный токен вне scope реестра (WETH — не
+    стейблкоин, legit_tokens.py покрывает только USDT/USDC) должен получить
+    нейтральную формулировку, а НЕ "вероятная подделка" — обнаружено живым
+    запуском в этой сессии (реальный трейс отфильтровал настоящий WETH под
+    старую, некорректную для этого случая формулировку)."""
+    start = "0x1000000000000000000000000000000000000a"
+    anchor = 1786800000.0
+
+    weth = _evm_transfer_item(start, "0x9999999999999999999999999999999999999f", tx_hash="0xweth")
+    weth["token"] = {"symbol": "WETH", "address_hash": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"}
+    weth["timestamp"] = _iso(anchor + 10)
+
+    legit = _evm_transfer_item(start, "0x8888888888888888888888888888888888888e", tx_hash="0xlegit")
+    legit["timestamp"] = _iso(anchor + 20)
+
+    page = _page([weth, legit])
+    m_evm = AsyncMock(return_value=page)
+    m_registry = MagicMock(return_value=[])
+    with patch.object(bt, "get_token_transfers", m_evm), \
+         patch.object(bt.bridge_registry, "get_registry_for_evm_chain_id", m_registry):
+        result = _run(bt._walk_evm(1, start, max_hops=5, after_timestamp=anchor))
+
+    note = result["hops"][0]["filtered_unknown_token_note"]
+    assert note is not None
+    assert "WETH" in note
+    note_lower = note.lower()
+    assert "не обязательно подделка" in note_lower
+    assert "вероятная подделка" not in note_lower
+    print("test_walk_evm_neutral_wording_for_out_of_scope_legit_token: OK")
 
 
 def test_walk_evm_finds_match_on_later_page_stops_pagination():
@@ -1172,6 +1240,8 @@ if __name__ == "__main__":
     test_walk_evm_prefers_earliest_over_known_address_match()
     test_walk_evm_ignores_zero_value_candidates()
     test_walk_evm_ignores_unknown_token_contract_candidates()
+    test_walk_evm_flags_exact_symbol_match_as_likely_spoof()
+    test_walk_evm_neutral_wording_for_out_of_scope_legit_token()
     test_walk_evm_finds_match_on_later_page_stops_pagination()
     test_walk_evm_search_depth_exceeded_when_no_match_within_page_cap()
     test_walk_evm_rested_at_address_via_early_exit_before_page_cap()
