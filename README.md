@@ -43,6 +43,27 @@ python3 bridge_tracer.py --start <Tron-адрес отправителя> [--max
 python3 bridge_tracer.py --start <tx_hash> --start-type tx_hash
 ```
 
+Справка по аргументам (`argparse`, работает "из коробки", ничего отдельно
+не реализовано) — `-h`/`--help`:
+
+```bash
+python3 bridge_tracer.py --help
+```
+
+```
+usage: bridge_tracer.py [-h] --start START [--start-type {address,tx_hash}]
+                        [--max-hops MAX_HOPS]
+
+Сквозной трейсер пути транзакции: LayerZero Scan (Tron) -> LayerZero Scan
+(bridge) -> Blockscout Pro (EVM)
+
+options:
+  -h, --help            show this help message and exit
+  --start START         Tron-адрес отправителя или хэш депозитной tx на Tron
+  --start-type {address,tx_hash}
+  --max-hops MAX_HOPS
+```
+
 Одиночный сопоставитель одного хопа моста (без пост-bridge обхода) можно
 проверить отдельно:
 
