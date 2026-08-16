@@ -78,6 +78,7 @@ python3 bridge_tracer.py --start <tx_hash> --start-type tx_hash
 import argparse
 import asyncio
 import os
+import re
 import sys
 from datetime import datetime
 from typing import Any, Literal, Optional
@@ -104,7 +105,7 @@ import bridge_registry  # noqa: E402
 import observed_name_tags  # noqa: E402
 import legit_tokens  # noqa: E402
 from known_contracts import lookup_contract  # noqa: E402
-from tron_adapter import base58_to_hex, get_trc20_transfers, get_account_info as get_tron_account_info, close_client as _close_tron_client  # noqa: E402
+from tron_adapter import base58_to_hex, normalize_tron_address, get_trc20_transfers, get_account_info as get_tron_account_info, close_client as _close_tron_client  # noqa: E402
 from evm_adapter import get_token_transfers, get_address_info, close_client as _close_evm_client  # noqa: E402
 from usdt0_deployments import get_tron_oft_contracts  # noqa: E402
 
@@ -115,6 +116,36 @@ ZERO_ADDRESS = "0x" + "0" * 40
 # LayerZero-сообщений (source -> Arbitrum-хаб -> реальная сеть) — предел
 # защитный, а не наблюдаемое значение, см. цикл в trace_full_path().
 MAX_BRIDGE_HOPS = 3
+
+_EVM_TX_HASH_RE = re.compile(r"^(0x)?[0-9a-fA-F]{64}$")
+
+
+def _normalize_evm_tx_hash(raw: str) -> str:
+    """
+    Нормализует хэш транзакции для LayerZero Scan API (fetch_message ->
+    /v1/messages/tx/{txHash}) — требует префикс "0x", без него отдаёт "не
+    найдено" даже на существующем сообщении (тот же факт уже задокументирован
+    в _find_tron_bridge_deposit_via_trongrid при нормализации на границе
+    TronGrid -> LayerZero Scan — здесь применяем его же к пользовательскому
+    вводу --start-type tx_hash). Обнаружено живым запуском в этой сессии:
+    один и тот же хэш с "0x" и без него давал разные результаты (полный
+    успешный трейс vs BRIDGE_MESSAGE_NOT_FOUND) — трейсер честно, но
+    вводяще в заблуждение говорил "не найдено", хотя проблема была в
+    формате ввода, а не в отсутствии транзакции.
+
+    Валидирует формат (64 hex-символа — 32 байта, стандартная длина
+    keccak256/EVM tx hash, с необязательным префиксом 0x) — явная ошибка
+    здесь лучше, чем ложный BRIDGE_MESSAGE_NOT_FOUND на заведомо
+    некорректном вводе (опечатка, не тот тип хэша и т.п.).
+    """
+    stripped = raw.strip()
+    if not _EVM_TX_HASH_RE.match(stripped):
+        raise ValueError(
+            f"Некорректный формат tx_hash: {raw!r} — ожидается 64 hex-символа "
+            "(с необязательным префиксом 0x или без него), например "
+            "0x028e6fa6ca09ac4cfb6740b4d589463a5ed0df95bb51be3447d6bf7d47e39022"
+        )
+    return stripped if stripped.startswith("0x") else "0x" + stripped
 
 
 async def close_clients() -> None:
@@ -164,6 +195,24 @@ async def trace_full_path(
     hops: list[dict[str, Any]] = []
 
     if start_type == "address":
+        # normalize_tron_address принимает ЛЮБОЙ из трёх форматов Tron-адреса
+        # (base58 "T...", полный Tron hex "0x41.../41...", голый EVM-style
+        # hex "0x.../..." без версионного байта — именно так LayerZero Scan
+        # API отдаёт Tron-адреса, см. tron_adapter/address.py) и приводит к
+        # каноническому base58. Без этого пользовательский hex-ввод здесь
+        # МОГ БЫ дойти невалидированным до _find_tron_bridge_deposit_via_
+        # layerzero_scan(), которая сама вызывает base58_to_hex() на сыром
+        # start — и упасть необработанным ValueError ("Некорректный base58-
+        # символ '0'..."), если TronGrid-путь не нашёл совпадение и код
+        # провалился в fallback. Обнаружено живым запуском в этой сессии
+        # (TronGrid-путь, как ни странно, сам принял голый hex без проблем —
+        # баг проявляется только на fallback-пути). Валидируем здесь же, до
+        # любых сетевых вызовов — явная ошибка лучше, чем случайный crash
+        # посреди трейса.
+        try:
+            start = normalize_tron_address(start)
+        except ValueError as e:
+            raise ValueError(f"Некорректный Tron-адрес --start: {e}") from e
         deposit = await _find_tron_bridge_deposit(start)
         if deposit is None:
             return _flat_result(
@@ -181,7 +230,7 @@ async def trace_full_path(
         hops.append(deposit["hop"])
         bridge_tx_hash = deposit["tx_hash"]
     elif start_type == "tx_hash":
-        bridge_tx_hash = start
+        bridge_tx_hash = _normalize_evm_tx_hash(start)
     else:
         raise ValueError(f"Неизвестный start_type: {start_type!r} (ожидались 'address' или 'tx_hash')")
 

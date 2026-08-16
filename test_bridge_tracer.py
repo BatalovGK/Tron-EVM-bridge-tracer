@@ -704,12 +704,109 @@ def test_start_type_tx_hash_skips_tron_step():
         evm_pages={},
     )
     with p1, p2, p3, p4, p5, p6, p7, p8, p9:
-        result = _run(bt.trace_full_path("0xcae6f9052cc8...", start_type="tx_hash"))
+        result = _run(bt.trace_full_path(
+            "0xcae6f9052cc83b91a4688e83d616ada07c390df64289ae1c88f6b967982ce3d1", start_type="tx_hash",
+        ))
 
     assert result["final_status"] == "RESTED_AT_EXCHANGE"
     assert len(result["hops"]) == 1  # only the bridge hop, no tron_deposit hop
     assert result["hops"][0]["segment"] == "bridge"
     print("test_start_type_tx_hash_skips_tron_step: OK")
+
+
+def test_tx_hash_without_0x_prefix_gives_same_result_as_with_prefix():
+    """LayerZero Scan API требует префикс "0x" в URL — без него отдаёт "не
+    найдено" даже на существующем сообщении (тот же факт, что уже
+    задокументирован для границы TronGrid -> LayerZero Scan). Обнаружено
+    живым запуском в этой сессии: один и тот же хэш с "0x" и без него давал
+    РАЗНЫЕ результаты (полный трейс vs BRIDGE_MESSAGE_NOT_FOUND) — вводящий
+    в заблуждение UX-баг, не отсутствие транзакции. --start-type tx_hash
+    должен нормализовать оба варианта одинаково, ДО обращения к
+    find_bridge_crossing."""
+    raw_hash = "cae6f9052cc83b91a4688e83d616ada07c390df64289ae1c88f6b967982ce3d1"
+    recipient = BINANCE_ETH
+
+    for candidate in (raw_hash, "0x" + raw_hash):
+        p1, p2, p3, p4, p5, p6, p7, p8, p9 = _patched(
+            wallet_messages=None,
+            crossing=_crossing_delivered(to_address=recipient),
+            evm_pages={},
+        )
+        with p1, p2, p3, p4, p5, p6, p7, p8, p9:
+            result = _run(bt.trace_full_path(candidate, start_type="tx_hash"))
+            # m_cross — тот же объект, что запатчен в p2 (find_bridge_crossing)
+            m_cross = bt.lz.find_bridge_crossing
+            called_with = m_cross.call_args[0][0]
+
+        assert called_with == "0x" + raw_hash, f"ожидался нормализованный хэш, получено {called_with!r}"
+        assert result["final_status"] == "RESTED_AT_EXCHANGE"
+    print("test_tx_hash_without_0x_prefix_gives_same_result_as_with_prefix: OK")
+
+
+def test_invalid_tx_hash_format_raises_value_error():
+    """Заведомо некорректный tx_hash (не 64 hex-символа) должен вызывать
+    явную ValueError ДО любого сетевого вызова — не ложный
+    BRIDGE_MESSAGE_NOT_FOUND, который выглядел бы как "транзакция не
+    найдена", хотя на самом деле проблема в формате ввода."""
+    p1, p2, p3, p4, p5, p6, p7, p8, p9 = _patched(wallet_messages=None, crossing=None, evm_pages={})
+    with p1, p2, p3, p4, p5, p6, p7, p8, p9:
+        try:
+            _run(bt.trace_full_path("not-a-real-hash", start_type="tx_hash"))
+            assert False, "ожидалась ValueError"
+        except ValueError as e:
+            assert "формат tx_hash" in str(e)
+        m_cross = bt.lz.find_bridge_crossing
+        m_cross.assert_not_called()  # ошибка формата поймана ДО сетевого вызова
+    print("test_invalid_tx_hash_format_raises_value_error: OK")
+
+
+def test_address_hex_format_normalized_to_base58():
+    """--start-type address принимает не только base58 ("T..."), но и
+    hex-форматы (полный Tron hex "41..."/"0x41...", голый EVM-style hex
+    "0x..."/"..." без версионного байта — так LayerZero Scan API отдаёт
+    Tron-адреса) — normalize_tron_address приводит их к base58 ДО любого
+    сетевого вызова. Без этого голый hex мог дойти невалидированным до
+    _find_tron_bridge_deposit_via_layerzero_scan(), которая сама вызывает
+    base58_to_hex() на сыром вводе — и упасть необработанным ValueError,
+    если TronGrid-путь не нашёл совпадение (обнаружено живым запуском в
+    этой сессии)."""
+    hex_form = bt.base58_to_hex(TRON_SENDER)  # голый EVM-style hex, без 0x
+    recipient = BINANCE_ETH
+    p1, p2, p3, p4, p5, p6, p7, p8, p9 = _patched(
+        wallet_messages=_wallet_messages_response(from_hex="0x" + hex_form),
+        crossing=_crossing_delivered(to_address=recipient),
+        evm_pages={},
+    )
+    with p1, p2, p3, p4, p5, p6, p7, p8, p9:
+        result_hex = _run(bt.trace_full_path("0x" + hex_form, start_type="address"))
+    p1, p2, p3, p4, p5, p6, p7, p8, p9 = _patched(
+        wallet_messages=_wallet_messages_response(from_hex="0x" + hex_form),
+        crossing=_crossing_delivered(to_address=recipient),
+        evm_pages={},
+    )
+    with p1, p2, p3, p4, p5, p6, p7, p8, p9:
+        result_base58 = _run(bt.trace_full_path(TRON_SENDER, start_type="address"))
+
+    assert result_hex["final_status"] == result_base58["final_status"] == "RESTED_AT_EXCHANGE"
+    print("test_address_hex_format_normalized_to_base58: OK")
+
+
+def test_invalid_address_format_raises_clear_value_error():
+    """Заведомо некорректный Tron-адрес должен вызывать явную, понятную
+    ValueError ДО любого сетевого вызова — не внутренний crash где-то в
+    середине трейса на fallback-пути."""
+    p1, p2, p3, p4, p5, p6, p7, p8, p9 = _patched(wallet_messages=None, crossing=None, evm_pages={})
+    with p1, p2, p3, p4, p5, p6, p7, p8, p9:
+        try:
+            _run(bt.trace_full_path("not-a-real-address", start_type="address"))
+            assert False, "ожидалась ValueError"
+        except ValueError as e:
+            assert "Tron-адрес" in str(e)
+        m_wallet = bt.lz.find_messages_by_wallet
+        m_trc20 = bt.get_trc20_transfers
+        m_wallet.assert_not_called()
+        m_trc20.assert_not_called()
+    print("test_invalid_address_format_raises_clear_value_error: OK")
 
 
 # --- Тесты пагинации _walk_evm (реестр-чек против выбранного time-anchoring
@@ -1068,6 +1165,10 @@ if __name__ == "__main__":
     test_in_transit_not_delivered()
     test_non_evm_destination_stops_cleanly()
     test_start_type_tx_hash_skips_tron_step()
+    test_tx_hash_without_0x_prefix_gives_same_result_as_with_prefix()
+    test_invalid_tx_hash_format_raises_value_error()
+    test_address_hex_format_normalized_to_base58()
+    test_invalid_address_format_raises_clear_value_error()
     test_walk_evm_prefers_earliest_over_known_address_match()
     test_walk_evm_ignores_zero_value_candidates()
     test_walk_evm_ignores_unknown_token_contract_candidates()
