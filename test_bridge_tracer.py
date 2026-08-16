@@ -104,11 +104,17 @@ def _crossing_compose_failed(to_address="0x000000000000000000000000000000000000a
 
 
 def _evm_transfer_item(from_addr, to_addr, tx_hash="0xhop1"):
+    """address_hash по умолчанию — реальный официальный Ethereum USDT-контракт
+    (см. legit_tokens.py), чтобы существующие тесты (проверяющие ДРУГУЮ логику
+    _walk_evm — пагинацию, dex_swap, max_hops и т.д.) автоматически проходили
+    фильтр по легитимному адресу контракта, а не ломались им. Тесты САМОГО
+    этого фильтра (test_walk_evm_ignores_unknown_token_contract_candidates)
+    явно переопределяют token.address_hash на неизвестный/поддельный."""
     return {
         "from": {"hash": from_addr}, "to": {"hash": to_addr},
         "transaction_hash": tx_hash,
         "total": {"value": "1000000", "decimals": "6"},
-        "token": {"symbol": "USDT"},
+        "token": {"symbol": "USDT", "address_hash": "0xdac17f958d2ee523a2206206994597c13d831ec7"},
         "timestamp": "2026-08-15T01:00:00.000000Z",
     }
 
@@ -806,6 +812,40 @@ def test_walk_evm_ignores_zero_value_candidates():
     print("test_walk_evm_ignores_zero_value_candidates: OK")
 
 
+def test_walk_evm_ignores_unknown_token_contract_candidates():
+    """token.symbol легко подделать юникод-гомоглифом (напр. "ÚSDТ"/"U5DT"
+    вместо "USDT", найдены живым запуском в этой сессии) — token.address_hash
+    подделать нельзя (Blockscout резолвит symbol/name ИЗ САМОГО контракта).
+    Один кандидат РАНЬШЕ по времени с адресом ВНЕ реестра легитимных
+    (legit_tokens.py) и один легитимный ПОЗЖЕ — должен выбраться легитимный,
+    а не более ранняя подделка; filtered_unknown_token_note должен объяснять,
+    что было отфильтровано (не amount-aware сопоставление сумм — просто
+    адрес контракта не совпал ни с одним известным официальным)."""
+    start = "0x1000000000000000000000000000000000000a"
+    anchor = 1786800000.0
+
+    spoofed = _evm_transfer_item(start, "0x9999999999999999999999999999999999999f", tx_hash="0xspoof")
+    spoofed["token"] = {"symbol": "ÚSDТ", "address_hash": "0x000000000000000000000000000000deadbeef"}
+    spoofed["timestamp"] = _iso(anchor + 10)  # раньше легитимного перевода
+
+    legit = _evm_transfer_item(start, "0x8888888888888888888888888888888888888e", tx_hash="0xlegit")
+    legit["timestamp"] = _iso(anchor + 20)  # позже, но единственный легитимный (дефолтный address_hash)
+
+    page = _page([spoofed, legit])
+    m_evm = AsyncMock(return_value=page)
+    m_registry = MagicMock(return_value=[])
+    with patch.object(bt, "get_token_transfers", m_evm), \
+         patch.object(bt.bridge_registry, "get_registry_for_evm_chain_id", m_registry):
+        result = _run(bt._walk_evm(1, start, max_hops=5, after_timestamp=anchor))
+
+    assert result["hops"][0]["tx_hash"] == "0xlegit"
+    assert result["hops"][0]["to_address"] == "0x8888888888888888888888888888888888888e"
+    note = result["hops"][0]["filtered_unknown_token_note"]
+    assert note is not None
+    assert "ÚSDТ" in note
+    print("test_walk_evm_ignores_unknown_token_contract_candidates: OK")
+
+
 def test_walk_evm_finds_match_on_later_page_stops_pagination():
     """Совпадение с реестром находится только на условной 4-й странице —
     остановка должна произойти именно на ней, страницы 5+ не запрашиваются
@@ -1030,6 +1070,7 @@ if __name__ == "__main__":
     test_start_type_tx_hash_skips_tron_step()
     test_walk_evm_prefers_earliest_over_known_address_match()
     test_walk_evm_ignores_zero_value_candidates()
+    test_walk_evm_ignores_unknown_token_contract_candidates()
     test_walk_evm_finds_match_on_later_page_stops_pagination()
     test_walk_evm_search_depth_exceeded_when_no_match_within_page_cap()
     test_walk_evm_rested_at_address_via_early_exit_before_page_cap()

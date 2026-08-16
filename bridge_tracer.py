@@ -102,6 +102,7 @@ if _AML_DIR not in sys.path:
 import layerzero_tracer as lz  # noqa: E402
 import bridge_registry  # noqa: E402
 import observed_name_tags  # noqa: E402
+import legit_tokens  # noqa: E402
 from known_contracts import lookup_contract  # noqa: E402
 from tron_adapter import base58_to_hex, get_trc20_transfers, get_account_info as get_tron_account_info, close_client as _close_tron_client  # noqa: E402
 from evm_adapter import get_token_transfers, get_address_info, close_client as _close_evm_client  # noqa: E402
@@ -686,6 +687,25 @@ async def _walk_evm(
     прихода, потому что после прихода получатель ещё ничего не отправлял, а
     прежний код честно долистал все 4 и ошибочно вернул SEARCH_DEPTH_EXCEEDED
     вместо RESTED_AT_ADDRESS).
+
+    ФИЛЬТРАЦИЯ ЗАВЕДОМО НЕЛЕГИТИМНЫХ КАНДИДАТОВ (не amount-aware сопоставление)
+    -------------------------------------------------------------------------------
+    Два дешёвых фильтра ДО выбора min() по времени — не сопоставление сумм
+    между хопами (сознательно не делаем, см. ограничения в docstring модуля),
+    а отсев вырожденных/подделанных случаев:
+      1. value == "0" — 0-value ERC-20 Transfer не может быть движением
+         прослеживаемых средств по определению; бесплатный инструмент для
+         address-poisoning спама (transfer(x, 0) не требует баланса).
+      2. token.address_hash не в legit_tokens.py/USDT0-реестре ("Token" role)
+         для этой сети — адрес контракта подделать нельзя (Blockscout берёт
+         symbol/name ИЗ САМОГО контракта), в отличие от token.symbol
+         (юникод-гомоглифы вроде "ÚSDТ"/"U5DT"/"ÚЅDТ", найдены живым
+         запуском в этой сессии). Пусто для непокрытой сети — фильтр не
+         применяется вовсе, безопасный fallback.
+    Оба обнаружены живым запуском на реальном address-poisoning-адресе в
+    этой сессии — см. README, раздел "Известные ограничения". Отфильтрованные
+    кандидаты не пропадают молча: счётчик/пример попадает в
+    hop["filtered_unknown_token_note"].
     """
     hops: list[dict[str, Any]] = []
     current = start_address
@@ -697,6 +717,19 @@ async def _walk_evm(
     except Exception:
         registry_entries = []  # USDT0 Deployments API недоступен — деградация до known_contracts.py-only
     registry_by_address = {e["address"].lower(): e for e in registry_entries}
+
+    # Легитимные адреса контрактов стейблкоинов на этой сети (см. docstring
+    # legit_tokens.py): статический реестр (USDT/USDC, проверено по
+    # первоисточникам Tether/Circle) + роль "Token" из уже загруженного выше
+    # USDT0 Deployments API (для Arbitrum/Polygon/Optimism, где USDT физически
+    # стал USDT0-контрактом — переиспользуем registry_entries, без нового
+    # сетевого запроса). Пусто для сети без покрытия ни одним источником
+    # (напр. BNB Chain) — тогда фильтр ниже безопасно НЕ применяется вовсе
+    # (fallback = прежнее поведение), а не отбрасывает все кандидаты подряд.
+    legit_token_addresses: dict[str, str] = dict(legit_tokens.LEGIT_TOKEN_CONTRACTS.get(chain_id, {}))
+    for e in registry_entries:
+        if e.get("contract_role") == "Token":
+            legit_token_addresses.setdefault(e["address"].lower(), e.get("protocol", "USDT0"))
 
     for hop_number in range(1, max_hops + 1):
         label = _known_evm_label(chain_id, current, registry_by_address)
@@ -710,6 +743,8 @@ async def _walk_evm(
         pages_fetched = 0
         hit_natural_end = False
         crossed_before_arrival = False
+        filtered_unknown_token_count = 0
+        filtered_unknown_token_example: Optional[dict[str, Any]] = None
         while pages_fetched < max_pages_per_hop:
             page = await get_token_transfers(
                 chain_id=chain_id, address=current, token_standard="ERC-20",
@@ -734,6 +769,25 @@ async def _walk_evm(
             # случай "переместить было нечего", не требует знать сумму
             # предыдущего хопа.
             outgoing = [item for item in outgoing if (item.get("total") or {}).get("value") != "0"]
+            # token.address_hash, а не token.symbol — символ подделать легко
+            # юникод-гомоглифом (напр. "ÚSDТ"/"U5DT" вместо "USDT", найдены
+            # живым запуском в этой сессии), Blockscout резолвит symbol/name
+            # ИЗ САМОГО контракта, так что подделать адрес нельзя. Пусто для
+            # непокрытой сети (legit_token_addresses == {}) — фильтр тогда не
+            # применяется вовсе, а не отбрасывает все кандидаты подряд.
+            if legit_token_addresses:
+                unknown_token = [
+                    item for item in outgoing
+                    if ((item.get("token") or {}).get("address_hash") or "").lower() not in legit_token_addresses
+                ]
+                if unknown_token:
+                    filtered_unknown_token_count += len(unknown_token)
+                    if filtered_unknown_token_example is None:
+                        filtered_unknown_token_example = unknown_token[0]
+                outgoing = [
+                    item for item in outgoing
+                    if ((item.get("token") or {}).get("address_hash") or "").lower() in legit_token_addresses
+                ]
             if not_before is not None:
                 outgoing = [
                     item for item in outgoing
@@ -803,6 +857,18 @@ async def _walk_evm(
 
         tx_hash = next_transfer.get("transaction_hash")
 
+        filtered_unknown_token_note: Optional[str] = None
+        if filtered_unknown_token_count:
+            example_token = (filtered_unknown_token_example or {}).get("token") or {}
+            filtered_unknown_token_note = (
+                f"Отфильтровано {filtered_unknown_token_count} кандидат(ов) на этом хопе — адрес токен-"
+                "контракта не найден в реестре легитимных (legit_tokens.py) для этой сети, напр. symbol="
+                f"{example_token.get('symbol')!r} address_hash={example_token.get('address_hash')!r} "
+                f"tx={filtered_unknown_token_example.get('transaction_hash')!r}. Возможна подделка "
+                "(юникод-гомоглиф символа или неизвестный/скам-токен) — не amount-aware сопоставление, "
+                "просто адрес контракта не совпал ни с одним известным официальным."
+            )
+
         if to_addr.lower() == ZERO_ADDRESS:
             # Burn: Transfer(from, 0x0, amount) — токен уничтожен, адрес 0x0 не
             # принадлежит никому и не может быть "следующим получателем" для
@@ -820,6 +886,7 @@ async def _walk_evm(
                 "from_address": current, "to_address": to_addr, "tx_hash": tx_hash,
                 "token_symbol": token.get("symbol"), "value_raw": total.get("value"),
                 "value_decimals": total.get("decimals"), "timestamp": next_transfer.get("timestamp"),
+                "filtered_unknown_token_note": filtered_unknown_token_note,
             })
             return {"hops": hops, "final_status": "RESTED_AT_ADDRESS", "final_address": to_addr,
                     "final_tx_hash": tx_hash,
@@ -851,6 +918,7 @@ async def _walk_evm(
             "value_raw": total.get("value"),
             "value_decimals": total.get("decimals"),
             "timestamp": next_transfer.get("timestamp"),
+            "filtered_unknown_token_note": filtered_unknown_token_note,
         })
 
         # Проверка ПОСЛЕ выбора кандидата (см. докстринг функции) — тот же
