@@ -9,14 +9,8 @@ aiohttp             # aml/evm_adapter, aml/tron_adapter (асинхронные 
 
 # --- Кэш и конфигурация ---
 aiosqlite           # aml/evm_adapter/cache.py, aml/tron_adapter/cache.py (диск-кэш ответов)
-pyyaml              # aml/evm_adapter/config/chains.yaml, aml/flow_tracer/config/*.yaml
+pyyaml              # aml/evm_adapter/config/chains.yaml
 python-dotenv       # aml/common/secrets.py — автозагрузка .env
-
-# --- Только для полного набора тестов (aml/, не используется bridge_tracer.py напрямую) ---
-asyncpg             # aml/common/db.py — импортируется транзитивно через common.evidence_store
-                    # (flow_tracer/attribution модули), даже если сама БД не используется в тестах трейсера
-ollama              # aml/agent/orchestrator.py — импортируется тестами aml/agent/tests/ (типы сообщений),
-                    # реальный Ollama-сервер для тестов не нужен
 
 # --- Тестирование ---
 pytest
